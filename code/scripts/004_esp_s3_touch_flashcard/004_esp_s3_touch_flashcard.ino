@@ -14,6 +14,10 @@
  *     lower-right quadrant is "Correct". Either one just advances to a new
  *     random card -- nothing is persisted.
  *
+ * Also latches the board's battery power on at boot and honors the physical
+ * PWR button (long-press to shut down), so it works untethered from USB --
+ * see the PIN_VBAT_PWR / PIN_PWR_BTN comments below.
+ *
  * Arduino IDE settings: same as 003_esp_s3_touch_quadrants_on_serial.
  */
 
@@ -28,7 +32,19 @@ static const int PIN_TP_SDA  = 47;
 static const int PIN_TP_SCL  = 48;
 static const int PIN_TP_INT  = 21;   // active low, falls on new touch (unused: we poll)
 static const int PIN_TP_RST  = 7;
-static const int PIN_EPD_PWR = 6;    // peripheral power rail, active LOW
+static const int PIN_EPD_PWR = 6;    // e-paper power rail, active LOW
+
+// Battery self-latch: pressing the physical PWR button gives the board a
+// momentary jolt of power; firmware must drive PIN_VBAT_PWR HIGH within that
+// window or it dies again. Holding PWR_BUTTON for PWR_LONGPRESS_MS drives it
+// back LOW to cut power for a clean shutdown. Matches Waveshare's official
+// board_power_bsp/button_bsp reference (waveshareteam/ESP32-S3-ePaper-1.54).
+// On USB power this is a no-op for staying alive (USB supplies the board
+// regardless), but we still latch/unlatch it so behavior matches when the
+// board is later run untethered.
+static const int PIN_VBAT_PWR = 17;
+static const int PIN_PWR_BTN  = 18;  // active LOW (button ties it to GND)
+static const uint32_t PWR_LONGPRESS_MS = 1000;
 
 static const int PIN_EPD_CS   = 11;
 static const int PIN_EPD_DC   = 10;
@@ -215,7 +231,33 @@ static void pickNextCard() {
   currentIndex = random(0, NUM_PAIRS);
 }
 
+// Long-press on PWR: show a shutdown screen, then release the battery latch.
+// On battery this cuts power outright; over USB the board stays alive (USB
+// feeds it independently of the latch), so we park in an idle loop instead
+// of falling back into the game.
+static void powerOff() {
+  Serial.println("PWR long-press -> shutting down");
+  display.setFullWindow();
+  display.firstPage();
+  do {
+    display.fillScreen(GxEPD_WHITE);
+    display.setFont(&FreeMonoBold12pt7b);
+    printCentered(MID_X, 100, "Bye!");
+  } while (display.nextPage());
+
+  digitalWrite(PIN_VBAT_PWR, LOW);   // release latch -- powers off on battery
+
+  while (true) delay(1000);          // still running (e.g. on USB): stay idle
+}
+
 void setup() {
+  // Latch battery power on first, before anything else -- the window between
+  // the PWR button's momentary jolt and this line is the only thing keeping
+  // the board alive when running untethered.
+  pinMode(PIN_VBAT_PWR, OUTPUT);
+  digitalWrite(PIN_VBAT_PWR, HIGH);
+  pinMode(PIN_PWR_BTN, INPUT_PULLUP);
+
   Serial.begin(115200);
   delay(300);
   Serial.println();
@@ -244,6 +286,17 @@ void setup() {
 
 void loop() {
   static bool wasTouching = false;
+  static bool pwrBtnDown = false;
+  static uint32_t pwrDownAt = 0;
+
+  if (digitalRead(PIN_PWR_BTN) == LOW) {
+    if (!pwrBtnDown) { pwrBtnDown = true; pwrDownAt = millis(); }
+    else if (millis() - pwrDownAt >= PWR_LONGPRESS_MS) {
+      powerOff();   // does not return on battery
+    }
+  } else {
+    pwrBtnDown = false;
+  }
 
   int x, y;
   bool touching = readTouch(x, y);
