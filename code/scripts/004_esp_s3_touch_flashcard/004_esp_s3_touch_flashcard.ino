@@ -46,6 +46,18 @@ static const uint8_t FT6336_ADDR = 0x38;
 static const int W = 200, H = 200;
 static const int MID_X = W / 2, MID_Y = H / 2;
 
+// Button boxes (shared by the drawing code and the touch-down flash, so
+// they always line up exactly).
+static const int BTN_Y   = MID_Y + 4;
+static const int BTN_H   = H - MID_Y - 8;
+static const int WIDE_BTN_X = 4,          WIDE_BTN_W  = W - 8;        // Reveal
+static const int LEFT_BTN_X = 4,          LEFT_BTN_W  = MID_X - 8;    // Wrong
+static const int RIGHT_BTN_X = MID_X + 4, RIGHT_BTN_W = MID_X - 8;    // Correct
+static const int WIDE_CX  = WIDE_BTN_X + WIDE_BTN_W / 2;
+static const int LEFT_CX  = LEFT_BTN_X + LEFT_BTN_W / 2;
+static const int RIGHT_CX = RIGHT_BTN_X + RIGHT_BTN_W / 2;
+static const int BTN_LABEL_Y = 155;
+
 enum Zone { ZONE_NONE, ZONE_LL, ZONE_LR, ZONE_UPPER };
 
 // ---- Orientation calibration (validated in 003) ----
@@ -129,6 +141,25 @@ static void printCentered(int cx, int baselineY, const char *text) {
   display.print(text);
 }
 
+// Instant touch-down acknowledgment: inverts the tapped button (black fill,
+// white label) via a small, fast partial-window refresh, before the real
+// (slower) screen transition runs. Confirms the tap was registered well
+// before the actual content change is visible.
+static void flashBox(int x, int y, int w, int h, const char *label, const GFXfont *font) {
+  display.setPartialWindow(x, y, w, h);
+  display.firstPage();
+  do {
+    display.fillScreen(GxEPD_BLACK);
+    display.setFont(font);
+    display.setTextColor(GxEPD_WHITE);
+    printCentered(x + w / 2, BTN_LABEL_Y, label);
+  } while (display.nextPage());
+  display.setTextColor(GxEPD_BLACK);
+}
+
+// Full refresh: used when loading a new random card, since it's always
+// preceded by a partial refresh (the reveal) and a full refresh here keeps
+// ghosting from ever accumulating across more than one partial update.
 static void drawPromptScreen() {
   display.setFullWindow();
   display.firstPage();
@@ -144,15 +175,19 @@ static void drawPromptScreen() {
     display.print("is in?");
 
     display.drawLine(0, MID_Y, W - 1, MID_Y, GxEPD_BLACK);
-    display.drawRect(4, MID_Y + 4, W - 8, H - MID_Y - 8, GxEPD_BLACK);
+    display.drawRect(WIDE_BTN_X, BTN_Y, WIDE_BTN_W, BTN_H, GxEPD_BLACK);
 
     display.setFont(&FreeMonoBold12pt7b);
-    printCentered(MID_X, 155, "Reveal");
+    printCentered(WIDE_CX, BTN_LABEL_Y, "Reveal");
   } while (display.nextPage());
 }
 
+// Partial refresh: reveal is on the fast path users tap through quickly, so
+// this trades a little ghosting risk for ~0.3s updates instead of ~1-2s.
+// Safe here because drawPromptScreen() always runs right after and does a
+// full refresh, so ghosting never has more than one partial update to build.
 static void drawAnswerScreen() {
-  display.setFullWindow();
+  display.setPartialWindow(0, 0, W, H);
   display.firstPage();
   do {
     display.fillScreen(GxEPD_WHITE);
@@ -167,12 +202,12 @@ static void drawAnswerScreen() {
 
     display.drawLine(0, MID_Y, W - 1, MID_Y, GxEPD_BLACK);
     display.drawLine(MID_X, MID_Y, MID_X, H - 1, GxEPD_BLACK);
-    display.drawRect(4, MID_Y + 4, MID_X - 8, H - MID_Y - 8, GxEPD_BLACK);
-    display.drawRect(MID_X + 4, MID_Y + 4, MID_X - 8, H - MID_Y - 8, GxEPD_BLACK);
+    display.drawRect(LEFT_BTN_X, BTN_Y, LEFT_BTN_W, BTN_H, GxEPD_BLACK);
+    display.drawRect(RIGHT_BTN_X, BTN_Y, RIGHT_BTN_W, BTN_H, GxEPD_BLACK);
 
     display.setFont(&FreeMonoBold9pt7b);
-    printCentered(MID_X / 2, 155, "Wrong");
-    printCentered(MID_X + MID_X / 2, 155, "Correct");
+    printCentered(LEFT_CX, BTN_LABEL_Y, "Wrong");
+    printCentered(RIGHT_CX, BTN_LABEL_Y, "Correct");
   } while (display.nextPage());
 }
 
@@ -219,12 +254,20 @@ void loop() {
 
     if (gameState == STATE_PROMPT) {
       if (z == ZONE_LL || z == ZONE_LR) {
+        flashBox(WIDE_BTN_X, BTN_Y, WIDE_BTN_W, BTN_H, "Reveal", &FreeMonoBold12pt7b);
         gameState = STATE_ANSWER;
         drawAnswerScreen();
       }
     } else { // STATE_ANSWER
-      if (z == ZONE_LL || z == ZONE_LR) {
-        Serial.println(z == ZONE_LL ? "-> Wrong" : "-> Correct");
+      if (z == ZONE_LL) {
+        flashBox(LEFT_BTN_X, BTN_Y, LEFT_BTN_W, BTN_H, "Wrong", &FreeMonoBold9pt7b);
+        Serial.println("-> Wrong");
+        pickNextCard();
+        gameState = STATE_PROMPT;
+        drawPromptScreen();
+      } else if (z == ZONE_LR) {
+        flashBox(RIGHT_BTN_X, BTN_Y, RIGHT_BTN_W, BTN_H, "Correct", &FreeMonoBold9pt7b);
+        Serial.println("-> Correct");
         pickNextCard();
         gameState = STATE_PROMPT;
         drawPromptScreen();
