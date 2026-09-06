@@ -1,0 +1,20 @@
+default:
+    @just --list
+
+# Static analysis
+analyze:
+    flutter analyze
+
+# Run on a connected Android device / emulator with hot reload
+dev:
+    flutter run -d android
+
+# Build the debug APK and drop into its output directory (e.g. to run adb install)
+apk:
+    flutter build apk --debug
+    cd build/app/outputs/flutter-apk && exec $SHELL
+
+# Install the debug APK onto the connected device
+install:
+    flutter build apk --debug
+    adb install -r build/app/outputs/flutter-apk/app-debug.apk

@@ -1,0 +1,19 @@
+{
+  "statusLine": {
+    "type": "command",
+    "command": "\"/home/brokkoli/.claude/skills/mid-vibe-memorize/scripts/statusline.py\" \"/home/brokkoli/.claude/plugins/data/mid-vibe-memorize-skills-dir\""
+  },
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"/home/brokkoli/.claude/skills/mid-vibe-memorize/scripts/user-prompt-submit.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
