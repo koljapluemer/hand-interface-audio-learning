@@ -6,9 +6,10 @@
 <title>Flashcards BLE Sync</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4/dist/full.min.css" rel="stylesheet" type="text/css">
-<!-- Script fonts for card-content rendering (see FONT_STACK below). Add a
-     family here + to FONT_STACK to support another script; nothing else
-     needs to change, on this page or the device. -->
+<!-- Script fonts for card-content rendering (see SCRIPT_FONTS below). Add a
+     family here + a row to SCRIPT_FONTS to support another script; nothing
+     else needs to change, on this page or the device. Only the family(ies) a
+     given card's text actually needs get fetched at render time. -->
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Noto+Sans:wght@400;700&family=Noto+Sans+Arabic:wght@400;700&family=Noto+Sans+SC:wght@400;700&family=Noto+Sans+JP:wght@400;700&family=Noto+Sans+KR:wght@400;700&family=Noto+Sans+Devanagari:wght@400;700&family=Noto+Sans+Hebrew:wght@400;700&display=block" rel="stylesheet">
@@ -68,6 +69,7 @@
       <button id="saveBtn" class="btn btn-success btn-sm ml-auto">Save to device</button>
     </div>
 
+    <progress id="saveProgress" class="progress progress-primary w-full mb-2" value="0" max="100" hidden></progress>
     <div id="msg" class="text-sm min-h-5 mb-3"></div>
 
     <ul id="list" class="flex flex-col gap-2"></ul>
@@ -110,12 +112,30 @@ const BMP_ROW_BYTES = Math.ceil(BMP_W / 8);
 const BMP_BYTES = BMP_ROW_BYTES * BMP_H;
 const CARDS_MAGIC = 'FCB1';
 
-// Script coverage for rendering card text to bitmaps -- add a Google Fonts
-// family here (and to the <link> in <head>) to support another script; you
-// don't need to pick one per card, the browser falls back through this list
-// per-character automatically.
-const FONT_STACK = '"Noto Sans","Noto Sans Arabic","Noto Sans SC","Noto Sans JP","Noto Sans KR","Noto Sans Devanagari","Noto Sans Hebrew",sans-serif';
-const FONT_FAMILIES = ['Noto Sans', 'Noto Sans Arabic', 'Noto Sans SC', 'Noto Sans JP', 'Noto Sans KR', 'Noto Sans Devanagari', 'Noto Sans Hebrew'];
+// Script coverage for rendering card text to bitmaps. "Noto Sans" alone
+// already covers Latin/Cyrillic/Greek/Vietnamese, so it's the baseline for
+// everything; the other families are large (especially the CJK ones) and
+// are only fetched when a card's text actually contains matching characters
+// -- see fontFamiliesFor() below. Add a row here (and a family to the
+// <link> in <head>) to support another script.
+const SCRIPT_FONTS = [
+  { name: 'Noto Sans Arabic',     re: /[؀-ۿݐ-ݿࢠ-ࣿﭐ-﷿ﹰ-﻿]/ },
+  { name: 'Noto Sans Hebrew',     re: /[֐-׿]/ },
+  { name: 'Noto Sans Devanagari', re: /[ऀ-ॿ]/ },
+  { name: 'Noto Sans SC',         re: /[㐀-䶿一-鿿]/ },
+  { name: 'Noto Sans JP',         re: /[぀-ヿ]/ },
+  { name: 'Noto Sans KR',         re: /[가-힣]/ },
+];
+
+function fontFamiliesFor(text) {
+  const families = ['Noto Sans'];
+  for (const { name, re } of SCRIPT_FONTS) if (re.test(text)) families.push(name);
+  return families;
+}
+
+function fontStackFor(text) {
+  return fontFamiliesFor(text).map((f) => `"${f}"`).join(',') + ',sans-serif';
+}
 
 let device = null, rxChar = null, txChar = null;
 let cards = [];   // [{f, b}]
@@ -132,6 +152,7 @@ const els = {
   statsBtn: document.getElementById('statsBtn'),
   statsBody: document.getElementById('statsBody'),
   msg: document.getElementById('msg'),
+  saveProgress: document.getElementById('saveProgress'),
   list: document.getElementById('list'),
   empty: document.getElementById('empty'),
   rowTpl: document.getElementById('cardRowTpl'),
@@ -141,6 +162,16 @@ function setMsg(text, kind) {
   els.msg.textContent = text || '';
   els.msg.className = 'text-sm min-h-5 mb-3' +
     (kind === 'err' ? ' text-error' : kind === 'ok' ? ' text-success' : ' text-base-content/60');
+}
+
+function showProgress(pct, text) {
+  els.saveProgress.hidden = false;
+  els.saveProgress.value = pct;
+  setMsg(text);
+}
+
+function hideProgress() {
+  els.saveProgress.hidden = true;
 }
 
 function setConnected(isConnected) {
@@ -168,15 +199,6 @@ function render() {
 
 // ---- Card text -> 1bpp bitmap (all script/shaping work happens here, via
 // the browser's own text-layout engine -- the device never sees a font) ----
-let fontsReady = null;
-function ensureFontsReady() {
-  if (!fontsReady) {
-    fontsReady = Promise.all(FONT_FAMILIES.map((fam) => document.fonts.load(`16px "${fam}"`)))
-      .then(() => document.fonts.ready);
-  }
-  return fontsReady;
-}
-
 const renderCanvas = document.createElement('canvas');
 renderCanvas.width = BMP_W;
 renderCanvas.height = BMP_H;
@@ -213,21 +235,28 @@ function thresholdImageData(imgData, level) {
 
 // Renders `text` centered-vertically, left-aligned, shrinking the font until
 // it fits the box (falling back to horizontal squeeze via fillText's
-// maxWidth for pathological cases), then thresholds to black/white.
-function renderTextTo1bpp(text) {
+// maxWidth for pathological cases), then thresholds to black/white. Only
+// loads the font family/families this specific text needs (via `text` as
+// document.fonts.load()'s match string, so it resolves the actual
+// unicode-range chunk the characters need, not just some default one) --
+// the browser caches each chunk after the first fetch, so a deck's second
+// save, or a second card in the same script, is instant.
+async function renderTextTo1bpp(text) {
   rctx.clearRect(0, 0, BMP_W, BMP_H);
   rctx.fillStyle = '#fff';
   rctx.fillRect(0, 0, BMP_W, BMP_H);
   if (text) {
+    const stack = fontStackFor(text);
+    await Promise.all(fontFamiliesFor(text).map((fam) => document.fonts.load(`16px "${fam}"`, text)));
     rctx.fillStyle = '#000';
     rctx.textBaseline = 'middle';
     rctx.textAlign = 'left';
     const maxWidth = BMP_W - 4;
     let size = BMP_H - 6;
-    rctx.font = `${size}px ${FONT_STACK}`;
+    rctx.font = `${size}px ${stack}`;
     while (size > 8 && rctx.measureText(text).width > maxWidth) {
       size -= 1;
-      rctx.font = `${size}px ${FONT_STACK}`;
+      rctx.font = `${size}px ${stack}`;
     }
     rctx.fillText(text, 2, BMP_H / 2, maxWidth);
   }
@@ -236,7 +265,8 @@ function renderTextTo1bpp(text) {
 }
 
 // ---- /cards.bin binary format: see the header comment in the .ino ----
-function buildCardsBin(cardList) {
+// `onProgress(done, total)`, if given, fires after each card is rendered.
+async function buildCardsBin(cardList, onProgress) {
   const enc = new TextEncoder();
   const parts = [];
   const header = new Uint8Array(8);
@@ -245,14 +275,18 @@ function buildCardsBin(cardList) {
   header[6] = BMP_H & 0xff;       header[7] = (BMP_H >> 8) & 0xff;
   parts.push(header);
 
-  for (const c of cardList) {
+  for (let i = 0; i < cardList.length; i++) {
+    const c = cardList[i];
     const frontText = enc.encode(c.f), backText = enc.encode(c.b);
     const lenPair = (n) => new Uint8Array([n & 0xff, (n >> 8) & 0xff]);
+    const frontBmp = await renderTextTo1bpp(c.f);
+    const backBmp = await renderTextTo1bpp(c.b);
     parts.push(
       lenPair(frontText.length), frontText,
       lenPair(backText.length), backText,
-      renderTextTo1bpp(c.f), renderTextTo1bpp(c.b),
+      frontBmp, backBmp,
     );
+    if (onProgress) onProgress(i + 1, cardList.length);
   }
 
   const total = parts.reduce((n, p) => n + p.length, 0);
@@ -291,9 +325,10 @@ async function writeRaw(bytes) {
   else await rxChar.writeValue(bytes);
 }
 
-async function writeChunked(bytes) {
+async function writeChunked(bytes, onProgress) {
   for (let i = 0; i < bytes.length; i += CHUNK) {
     await writeRaw(bytes.slice(i, i + CHUNK));
+    if (onProgress) onProgress(Math.min(i + CHUNK, bytes.length), bytes.length);
   }
 }
 
@@ -376,7 +411,7 @@ async function refreshStats() {
   }
 }
 
-async function putCardsBin(body) {
+async function putCardsBin(body, onProgress) {
   const header = new Uint8Array(5);
   header[0] = 0x02;
   header[1] = body.length & 0xff;
@@ -397,7 +432,7 @@ async function putCardsBin(body) {
     (async () => {
       try {
         await writeRaw(header);
-        await writeChunked(body);
+        await writeChunked(body, onProgress);
       } catch (err) {
         cleanup();
         reject(err);
@@ -499,17 +534,25 @@ els.csvInput.addEventListener('change', async (e) => {
 
 els.saveBtn.addEventListener('click', async () => {
   const clean = cards.map(c => ({ f: c.f.trim(), b: c.b.trim() })).filter(c => c.f || c.b);
-  setMsg('Rendering card bitmaps...');
+  els.saveBtn.disabled = true;
+  showProgress(0, `Rendering card 0 of ${clean.length}...`);
   try {
-    await ensureFontsReady();
-    const bin = buildCardsBin(clean);
-    setMsg('Saving...');
-    await putCardsBin(bin);
+    const bin = await buildCardsBin(clean, (done, total) => {
+      showProgress((done / total) * 70, `Rendering card ${done} of ${total}...`);
+    });
+    showProgress(75, 'Sending to device...');
+    await putCardsBin(bin, (sent, total) => {
+      showProgress(75 + (sent / total) * 25, `Sending to device... (${sent}/${total} bytes)`);
+    });
     cards = clean;
     render();
+    hideProgress();
     setMsg(`Saved ${clean.length} card(s) to the SD card. Tap Restart on the device.`, 'ok');
   } catch (err) {
+    hideProgress();
     setMsg('Save failed: ' + err.message, 'err');
+  } finally {
+    els.saveBtn.disabled = false;
   }
 });
 
@@ -522,7 +565,7 @@ if (!navigator.bluetooth) {
   document.getElementById('linuxFlagHint').hidden = !isLinux;
 } else {
   setConnected(false);
-  ensureFontsReady();   // warm the font cache in the background, before Save needs it
+  document.fonts.load('16px "Noto Sans"');   // warm the common case in the background
 }
 </script>
 </body>
