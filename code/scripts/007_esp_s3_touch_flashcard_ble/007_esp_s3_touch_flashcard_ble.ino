@@ -94,6 +94,7 @@
 #include <BLEUtils.h>
 #include <BLE2902.h>
 #include "SD_MMC.h"
+#include "esp_system.h"   // esp_reset_reason() -- see resetReasonStr() below
 
 // UI chrome only (button labels, settings/sync text, "No flashcards"
 // message) -- all fixed ASCII strings. Card front/back are pre-rendered
@@ -226,17 +227,27 @@ static const size_t BLE_CHUNK = 180;   // payload bytes per notify/write
 static BLEServer *pServer = nullptr;
 static BLECharacteristic *pTxCharacteristic = nullptr;
 static volatile bool bleConnected = false;
-// Set by TxCallbacks::onStatus() whenever a notify() call fails to queue
-// (stack congested / out of send buffers) -- sendFileOverBle() polls this to
-// back off and retry only when actually needed, instead of a fixed per-chunk
-// delay that would throttle every send whether or not it was necessary.
+// Set by TxCallbacks::onStatus() whenever an indicate() call fails to queue
+// (stack congested / out of send buffers) or times out waiting for the
+// peer's confirmation -- sendChunkReliably() polls this to back off and
+// retry only when actually needed, instead of a fixed per-chunk delay that
+// would throttle every send whether or not it was necessary.
 static volatile bool notifyCongested = false;
 
+// PUT bodies (and GET responses, see sendFileOverBle() below) are streamed
+// straight to/from the SD card in BLE_CHUNK-sized pieces rather than
+// buffered whole in RAM -- a 1000-card deck is ~1.7MB, and round-tripping
+// that through a std::vector on top of everything else this device already
+// holds is exactly the kind of heap pressure that caused a crash right
+// after a large save/load completed (confirmed: SD write and BLE ack both
+// logged success, then a reboot). Streaming caps the RAM cost at one
+// BLE_CHUNK-sized buffer regardless of deck size.
 enum RxState { RX_IDLE, RX_BODY };
 static RxState rxState = RX_IDLE;
-static std::vector<uint8_t> rxBuffer;
 static size_t rxExpected = 0;
 static size_t rxReceived = 0;
+static File putFile;         // open across the PUT's onWrite() calls
+static bool putOk = false;   // false if sdOk was false, open failed, or a write came up short
 
 // RxCallbacks::onWrite() runs on the NimBLE host task, inside that task's
 // own (comparatively small) stack frame for the callback. Calling back into
@@ -692,22 +703,29 @@ static void handlePowerButton() {
 
 // ---- BLE protocol: GET (send /cards.bin), GET state (send /state.tsv,
 // read-only, for the sync page's stats panel), and PUT (overwrite cards) ----
-// Sends one notify payload, retrying with a short backoff if the local send
-// queue is momentarily full (see TxCallbacks::onStatus() / notifyCongested
-// below), and always yielding a little even on the fast path -- this loop
-// can run on the NimBLE host task itself (called synchronously from
-// RxCallbacks::onWrite()), so a long run with no yield at all risks
-// starving the watchdog. Returns false if the client disconnected mid-retry
-// so the caller can give up instead of retrying forever.
+// Sends one payload via indicate() rather than notify(). notify() is
+// fire-and-forget at the ATT level -- the peer never confirms receipt, so a
+// silently dropped packet (which does happen; BLE has no guaranteed
+// delivery) permanently truncates the transfer with neither side the
+// wiser. indicate() waits for the peer's ATT-level confirmation (up to
+// BLECharacteristic::indicationTimeout, 1000ms) before returning, so a drop
+// surfaces here as a normal, retryable failure instead of silent data loss.
+// Also retries with a short backoff if the local send queue is momentarily
+// full (see TxCallbacks::onStatus() / notifyCongested below), and always
+// yields a little even on the fast path -- this loop can run on the NimBLE
+// host task itself (called synchronously from RxCallbacks::onWrite()), so a
+// long run with no yield at all risks starving the watchdog. Returns false
+// if the client disconnected mid-retry so the caller can give up instead of
+// retrying forever.
 static bool sendChunkReliably(const uint8_t *data, size_t n) {
   for (;;) {
     if (!bleConnected) return false;
     notifyCongested = false;
     pTxCharacteristic->setValue(data, n);
-    pTxCharacteristic->notify();
+    pTxCharacteristic->indicate();
     if (notifyCongested) {
-      delay(15);   // stack briefly out of send buffers; back off and retry
-      continue;    // this same chunk, instead of throttling every chunk
+      delay(15);   // stack briefly out of send buffers, or peer didn't
+      continue;    // confirm in time -- back off and retry this same chunk
     }
     delay(2);
     return true;
@@ -715,17 +733,12 @@ static bool sendChunkReliably(const uint8_t *data, size_t n) {
 }
 
 static void sendFileOverBle(const char *path, uint8_t cmd) {
-  std::vector<uint8_t> content;
+  File f;
+  size_t total = 0;
   if (sdOk) {
-    File f = SD_MMC.open(path, FILE_READ);
-    if (f) {
-      content.resize(f.size());
-      if (!content.empty()) f.read(content.data(), content.size());
-      f.close();
-    }
+    f = SD_MMC.open(path, FILE_READ);
+    if (f) total = f.size();
   }
-  size_t total = content.size();
-  const uint8_t *data = content.data();
 
   uint8_t header[5];
   header[0] = cmd;
@@ -741,52 +754,49 @@ static void sendFileOverBle(const char *path, uint8_t cmd) {
   // retry path as the body chunks below.
   if (!sendChunkReliably(header, sizeof(header))) {
     Serial.printf("BLE: aborted send (%s), client disconnected\n", path);
+    if (f) f.close();
     return;
   }
 
+  static uint8_t chunkBuf[BLE_CHUNK];   // reused across calls; never on the stack
   size_t sent = 0;
-  while (sent < total) {
+  while (f && sent < total) {
     size_t n = minSize(BLE_CHUNK, total - sent);
-    if (!sendChunkReliably(data + sent, n)) {
+    if (f.read(chunkBuf, n) != n) {
+      Serial.printf("BLE: SD read short (%s) at %u/%u\n", path, (unsigned)sent, (unsigned)total);
+      break;
+    }
+    if (!sendChunkReliably(chunkBuf, n)) {
       Serial.printf("BLE: aborted send (%s), client disconnected\n", path);
+      f.close();
       return;
     }
     sent += n;
   }
-  Serial.printf("BLE: sent %u bytes (%s)\n", (unsigned)total, path);
+  if (f) f.close();
+  Serial.printf("BLE: sent %u bytes (%s)\n", (unsigned)sent, path);
 }
 
 static void sendCardsOverBle() { sendFileOverBle("/cards.bin", 0x01); }
 static void sendStateOverBle() { sendFileOverBle("/state.tsv", 0x03); }
 
 static void finishPut() {
-  bool ok = sdOk;
-  if (ok) {
-    File f = SD_MMC.open("/cards.bin", FILE_WRITE);   // "w" -> truncates
-    if (!f) {
-      ok = false;
-    } else {
-      if (!rxBuffer.empty()) f.write(rxBuffer.data(), rxBuffer.size());
-      f.close();
-    }
-  }
+  if (putFile) putFile.close();
   Serial.printf("BLE: wrote /cards.bin (%u bytes) -> %s\n",
-                (unsigned)rxBuffer.size(), ok ? "ok" : "FAILED");
+                (unsigned)rxReceived, putOk ? "ok" : "FAILED");
 
-  uint8_t resp[2] = { 0x02, (uint8_t)(ok ? 0x00 : 0x01) };
+  uint8_t resp[2] = { 0x02, (uint8_t)(putOk ? 0x00 : 0x01) };
   sendChunkReliably(resp, sizeof(resp));
 
   rxState = RX_IDLE;
-  rxBuffer.clear();
-  rxBuffer.shrink_to_fit();
 }
 
-// notify() (see BLECharacteristic::notify() in the Arduino BLE library) is
-// fire-and-forget: it queues the packet with the NimBLE host stack and calls
-// onStatus() synchronously with whether that queuing succeeded, before any
-// actual over-the-air send happens. ERROR_GATT here means the stack's send
-// buffers are full -- that's the only case sendFileOverBle() needs to back
-// off for.
+// indicate() (unlike notify()) blocks until the peer's ATT-level
+// confirmation arrives or indicationTimeout (1000ms) elapses, and reports
+// which via onStatus(): SUCCESS_INDICATE means confirmed delivery,
+// ERROR_GATT means the local send queue was full, ERROR_INDICATE_TIMEOUT
+// means the peer never confirmed (dropped packet, or it's just gone) --
+// sendChunkReliably() treats anything but success as "back off and retry".
 class TxCallbacks : public BLECharacteristicCallbacks {
   void onStatus(BLECharacteristic *pCharacteristic, Status s, uint32_t code) override {
     if (s != SUCCESS_NOTIFY && s != SUCCESS_INDICATE) notifyCongested = true;
@@ -809,13 +819,18 @@ class RxCallbacks : public BLECharacteristicCallbacks {
                           ((uint32_t)data[3] << 16) | ((uint32_t)data[4] << 24);
         rxExpected = total;
         rxReceived = 0;
-        rxBuffer.assign(total, 0);
+        putOk = sdOk;
+        if (putOk) {
+          putFile = SD_MMC.open("/cards.bin", FILE_WRITE);   // "w" -> truncates
+          if (!putFile) putOk = false;
+        }
         if (total == 0) pendingAction = PENDING_FINISH_PUT;   // actual finish: syncLoop()
         else rxState = RX_BODY;
       }
-    } else {   // RX_BODY: raw body bytes, no framing
+    } else {   // RX_BODY: raw body bytes, no framing -- streamed straight to
+               // SD as they arrive rather than buffered in RAM, see putFile.
       size_t n = minSize(len, rxExpected - rxReceived);
-      memcpy(rxBuffer.data() + rxReceived, data, n);
+      if (putOk && n > 0 && putFile.write(data, n) != n) putOk = false;
       rxReceived += n;
       if (rxReceived >= rxExpected) pendingAction = PENDING_FINISH_PUT;   // actual finish: syncLoop()
     }
@@ -826,8 +841,7 @@ class ServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer *pServer) override {
     bleConnected = true;
     rxState = RX_IDLE;
-    rxBuffer.clear();
-    rxBuffer.shrink_to_fit();
+    if (putFile) putFile.close();   // in case a prior connection dropped mid-PUT
     Serial.println("BLE: central connected");
     // NOTE: used to also call pServer->requestConnParams() here to ask for a
     // shorter connection interval. Removed after it looked like the crash
@@ -892,16 +906,21 @@ static void enterSyncMode() {
 
   BLEService *service = pServer->createService(NUS_SERVICE_UUID);
 
-  pTxCharacteristic = service->createCharacteristic(NUS_TX_UUID, BLECharacteristic::PROPERTY_NOTIFY);
+  // INDICATE alongside NOTIFY: sendChunkReliably() uses indicate() so every
+  // chunk gets a real delivery confirmation instead of the silent-drop risk
+  // notify() carries (see sendChunkReliably()'s comment).
+  pTxCharacteristic = service->createCharacteristic(
+    NUS_TX_UUID, BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_INDICATE);
   pTxCharacteristic->addDescriptor(new BLE2902());
   pTxCharacteristic->setCallbacks(new TxCallbacks());
 
-  // WRITE_NR (write-without-response) alongside WRITE: sync.html uses WRITE
-  // for the single-byte commands and the PUT header (needs the ATT-level
-  // ack for ordering/reliability) but WRITE_NR for PUT body chunks, which
-  // skips the per-chunk round trip and is the main lever on the upload side.
-  BLECharacteristic *rxChar = service->createCharacteristic(
-    NUS_RX_UUID, BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
+  // Plain WRITE (acknowledged): PUT body chunks used to go over WRITE_NR
+  // (write-without-response) for speed, but that's just as unacknowledged
+  // as notify() was, and it silently dropped data mid-upload in practice
+  // (a save would "complete" client-side with no error, but the device
+  // never received the full body and so never sent back a save-confirmed
+  // ack). Reliability matters more than the extra speed here.
+  BLECharacteristic *rxChar = service->createCharacteristic(NUS_RX_UUID, BLECharacteristic::PROPERTY_WRITE);
   rxChar->setCallbacks(new RxCallbacks());
 
   service->start();
@@ -915,6 +934,27 @@ static void enterSyncMode() {
   syncLoop();                         // never returns (exits via ESP.restart)
 }
 
+// The ROM-level boot banner ("rst:0xc (RTC_SW_CPU_RST)") is genuinely
+// ambiguous about *why* the chip reset -- it can mean either a software
+// crash/abort or, on some ESP32-S3 revisions, a brownout misreported
+// through that same path. esp_reset_reason() is the authoritative,
+// unambiguous API for this, so print it plainly at every boot.
+static const char *resetReasonStr(esp_reset_reason_t r) {
+  switch (r) {
+    case ESP_RST_POWERON:   return "POWERON (normal power-up)";
+    case ESP_RST_EXT:       return "EXT (external reset pin)";
+    case ESP_RST_SW:        return "SW (esp_restart() / ESP.restart())";
+    case ESP_RST_PANIC:     return "PANIC (crash: exception/abort)";
+    case ESP_RST_INT_WDT:   return "INT_WDT (interrupt watchdog)";
+    case ESP_RST_TASK_WDT:  return "TASK_WDT (task watchdog)";
+    case ESP_RST_WDT:       return "WDT (other watchdog)";
+    case ESP_RST_DEEPSLEEP: return "DEEPSLEEP (woke from deep sleep)";
+    case ESP_RST_BROWNOUT:  return "BROWNOUT (power supply sagged)";
+    case ESP_RST_SDIO:      return "SDIO";
+    default:                return "UNKNOWN";
+  }
+}
+
 // ---- Setup / loop ----
 void setup() {
   pinMode(PIN_VBAT_PWR, OUTPUT);
@@ -924,6 +964,7 @@ void setup() {
   Serial.begin(115200);
   delay(300);
   Serial.println();
+  Serial.printf("reset reason: %s\n", resetReasonStr(esp_reset_reason()));
   Serial.println("007_esp_s3_touch_flashcard_ble");
 
   pinMode(PIN_EPD_PWR, OUTPUT);

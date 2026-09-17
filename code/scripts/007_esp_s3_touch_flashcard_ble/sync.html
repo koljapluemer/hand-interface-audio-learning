@@ -322,31 +322,23 @@ function parseCardsBin(bytes) {
 }
 
 // ---- Low-level BLE write/notify plumbing ----
-// Used for the single-byte commands and the PUT header: "with response"
-// waits for the device's ATT-level ack, which is what we want for the few
-// writes where ordering/delivery of that specific byte matters.
-async function writeRaw(bytes) {
-  if (rxChar.writeValueWithResponse) await rxChar.writeValueWithResponse(bytes);
-  else await rxChar.writeValue(bytes);
-}
-
-// Used for PUT body chunks: "without response" skips the per-chunk ATT
-// round trip (each await only waits for the OS to accept the chunk into its
-// own send queue, not for the device to ack it), which is the main lever on
-// upload speed. Falls back to writeRaw() on RX characteristics that only
-// exposed the "write" property (older firmware).
+// Always "with response": waits for the device's ATT-level ack, so a
+// dropped chunk surfaces as a normal error instead of silently vanishing.
+// PUT body chunks used to go over writeValueWithoutResponse() for speed,
+// but that's unacknowledged -- a dropped chunk left the device's byte
+// counter short forever, so it never finished the save or sent back a
+// confirmation, which is exactly the "no save confirmation" failure this
+// was causing in practice. Reliability matters more than the extra speed.
 //
-// Chrome's writeValueWithoutResponse() promise can resolve before the OS
-// Bluetooth stack has actually finished the previous write, so even this
-// strictly sequential/awaited loop can occasionally throw "GATT operation
-// already in progress" -- a known, still-unresolved Chromium quirk (see
-// https://issues.chromium.org/issues/40435612), not something we can avoid
-// by awaiting harder. Chrome's own guidance is that the app must retry.
-async function writeRawFast(bytes) {
-  if (!rxChar.writeValueWithoutResponse) { await writeRaw(bytes); return; }
+// Chrome's write-with-response can still throw "GATT operation already in
+// progress" under load -- a known, still-unresolved Chromium quirk (see
+// https://issues.chromium.org/issues/40435612) -- so this retries that
+// specific error instead of treating it as fatal.
+async function writeRaw(bytes) {
   for (let attempt = 0; ; attempt++) {
     try {
-      await rxChar.writeValueWithoutResponse(bytes);
+      if (rxChar.writeValueWithResponse) await rxChar.writeValueWithResponse(bytes);
+      else await rxChar.writeValue(bytes);
       return;
     } catch (err) {
       if (attempt >= 7 || !/GATT operation already in progress/i.test(err.message)) throw err;
@@ -357,7 +349,7 @@ async function writeRawFast(bytes) {
 
 async function writeChunked(bytes, onProgress) {
   for (let i = 0; i < bytes.length; i += CHUNK) {
-    await writeRawFast(bytes.slice(i, i + CHUNK));
+    await writeRaw(bytes.slice(i, i + CHUNK));
     if (onProgress) onProgress(Math.min(i + CHUNK, bytes.length), bytes.length);
   }
 }
