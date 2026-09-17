@@ -66,6 +66,7 @@
         Import CSV
         <input id="csvInput" type="file" accept=".csv,text/csv,text/plain" class="hidden">
       </label>
+      <button id="deleteAllBtn" class="btn btn-error btn-outline btn-sm">Delete all</button>
       <button id="saveBtn" class="btn btn-success btn-sm ml-auto">Save to device</button>
     </div>
 
@@ -103,7 +104,7 @@
 const SERVICE_UUID = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
 const RX_UUID      = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';   // app -> device
 const TX_UUID      = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';   // device -> app
-const CHUNK = 180;   // must match BLE_CHUNK on the device
+const CHUNK = 180;   // must match BLE_CHUNK on the device (244 crashed the device -- see .ino)
 
 // ---- Card bitmap format (must match BMP_W/BMP_H and the /cards.bin layout
 // in 007_esp_s3_touch_flashcard_ble.ino) ----
@@ -148,6 +149,7 @@ const els = {
   idle: document.getElementById('idle'),
   addBtn: document.getElementById('addBtn'),
   csvInput: document.getElementById('csvInput'),
+  deleteAllBtn: document.getElementById('deleteAllBtn'),
   saveBtn: document.getElementById('saveBtn'),
   statsBtn: document.getElementById('statsBtn'),
   statsBody: document.getElementById('statsBody'),
@@ -320,14 +322,42 @@ function parseCardsBin(bytes) {
 }
 
 // ---- Low-level BLE write/notify plumbing ----
+// Used for the single-byte commands and the PUT header: "with response"
+// waits for the device's ATT-level ack, which is what we want for the few
+// writes where ordering/delivery of that specific byte matters.
 async function writeRaw(bytes) {
   if (rxChar.writeValueWithResponse) await rxChar.writeValueWithResponse(bytes);
   else await rxChar.writeValue(bytes);
 }
 
+// Used for PUT body chunks: "without response" skips the per-chunk ATT
+// round trip (each await only waits for the OS to accept the chunk into its
+// own send queue, not for the device to ack it), which is the main lever on
+// upload speed. Falls back to writeRaw() on RX characteristics that only
+// exposed the "write" property (older firmware).
+//
+// Chrome's writeValueWithoutResponse() promise can resolve before the OS
+// Bluetooth stack has actually finished the previous write, so even this
+// strictly sequential/awaited loop can occasionally throw "GATT operation
+// already in progress" -- a known, still-unresolved Chromium quirk (see
+// https://issues.chromium.org/issues/40435612), not something we can avoid
+// by awaiting harder. Chrome's own guidance is that the app must retry.
+async function writeRawFast(bytes) {
+  if (!rxChar.writeValueWithoutResponse) { await writeRaw(bytes); return; }
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await rxChar.writeValueWithoutResponse(bytes);
+      return;
+    } catch (err) {
+      if (attempt >= 7 || !/GATT operation already in progress/i.test(err.message)) throw err;
+      await new Promise((r) => setTimeout(r, 5 * (attempt + 1)));
+    }
+  }
+}
+
 async function writeChunked(bytes, onProgress) {
   for (let i = 0; i < bytes.length; i += CHUNK) {
-    await writeRaw(bytes.slice(i, i + CHUNK));
+    await writeRawFast(bytes.slice(i, i + CHUNK));
     if (onProgress) onProgress(Math.min(i + CHUNK, bytes.length), bytes.length);
   }
 }
@@ -340,9 +370,39 @@ function readU32LE(b, off) {
   return b[off] | (b[off + 1] << 8) | (b[off + 2] << 16) | (b[off + 3] << 24);
 }
 
-function getFileBytes(cmdByte) {
+// No response ever arrives if the device drops off mid-transfer (crash,
+// out of range, etc.) -- a plain notify listener would then hang forever
+// with no feedback, which is exactly what "stuck on Loading cards..." was.
+// So this also races a stall timer (reset on every chunk) and an explicit
+// disconnect listener, and always cleans both up via cleanup().
+const STALL_TIMEOUT_MS = 8000;
+
+function getFileBytes(cmdByte, onProgress) {
+  // Capture these locally: onDisconnected() (the page-wide handler) nulls
+  // out the shared `device`/`txChar` variables as soon as it runs, and
+  // since listeners fire in registration order, that handler (registered
+  // once at connect() time) runs before this function's own onDisconnect
+  // below -- cleanup() must not read the mutable globals or it dereferences
+  // null on exactly the disconnect it's trying to handle.
+  const dev = device, tx = txChar;
   return new Promise((resolve, reject) => {
-    let total = null, received = 0, buf = null;
+    let total = null, received = 0, buf = null, stallTimer = null;
+    function cleanup() {
+      clearTimeout(stallTimer);
+      tx.removeEventListener('characteristicvaluechanged', onNotify);
+      dev.removeEventListener('gattserverdisconnected', onDisconnect);
+    }
+    function armStallTimer() {
+      clearTimeout(stallTimer);
+      stallTimer = setTimeout(() => {
+        cleanup();
+        reject(new Error('device stopped responding (no data for 8s)'));
+      }, STALL_TIMEOUT_MS);
+    }
+    function onDisconnect() {
+      cleanup();
+      reject(new Error('device disconnected during transfer'));
+    }
     const onNotify = (e) => {
       const bytes = toBytes(e.target.value);
       if (total === null) {
@@ -358,22 +418,26 @@ function getFileBytes(cmdByte) {
         buf.set(bytes, received);
         received += bytes.length;
       }
+      if (onProgress) onProgress(received, total);
       if (received >= total) {
         cleanup();
         resolve(buf);
+      } else {
+        armStallTimer();
       }
     };
-    function cleanup() { txChar.removeEventListener('characteristicvaluechanged', onNotify); }
-    txChar.addEventListener('characteristicvaluechanged', onNotify);
+    tx.addEventListener('characteristicvaluechanged', onNotify);
+    dev.addEventListener('gattserverdisconnected', onDisconnect);
+    armStallTimer();
     writeRaw(new Uint8Array([cmdByte])).catch((err) => { cleanup(); reject(err); });
   });
 }
 
-async function getFileText(cmdByte) {
-  return new TextDecoder('utf-8').decode(await getFileBytes(cmdByte));
+async function getFileText(cmdByte, onProgress) {
+  return new TextDecoder('utf-8').decode(await getFileBytes(cmdByte, onProgress));
 }
 
-function getCardsBin() { return getFileBytes(0x01); }
+function getCardsBin(onProgress) { return getFileBytes(0x01, onProgress); }
 function getState() { return getFileText(0x03); }   // /state.tsv, read-only
 
 // ---- Learning stats (parses /state.tsv: front\tback\tbox\tpracticed) ----
@@ -419,7 +483,21 @@ async function putCardsBin(body, onProgress) {
   header[3] = (body.length >> 16) & 0xff;
   header[4] = (body.length >> 24) & 0xff;
 
+  // See getFileBytes() above for why: capture these now, since cleanup()
+  // must not read the mutable `device`/`txChar` globals (onDisconnected()
+  // nulls them out before this function's own onDisconnect below runs).
+  const dev = device, tx = txChar;
   return new Promise((resolve, reject) => {
+    let ackTimer = null;
+    function cleanup() {
+      clearTimeout(ackTimer);
+      tx.removeEventListener('characteristicvaluechanged', onNotify);
+      dev.removeEventListener('gattserverdisconnected', onDisconnect);
+    }
+    function onDisconnect() {
+      cleanup();
+      reject(new Error('device disconnected during transfer'));
+    }
     const onNotify = (e) => {
       const bytes = toBytes(e.target.value);
       if (bytes.length >= 2 && bytes[0] === 0x02) {
@@ -427,12 +505,19 @@ async function putCardsBin(body, onProgress) {
         bytes[1] === 0 ? resolve() : reject(new Error('device reported a save error (no SD card?)'));
       }
     };
-    function cleanup() { txChar.removeEventListener('characteristicvaluechanged', onNotify); }
-    txChar.addEventListener('characteristicvaluechanged', onNotify);
+    tx.addEventListener('characteristicvaluechanged', onNotify);
+    dev.addEventListener('gattserverdisconnected', onDisconnect);
     (async () => {
       try {
         await writeRaw(header);
         await writeChunked(body, onProgress);
+        // All bytes are on the wire; only the device's SD write + ack notify
+        // are left, which should be near-instant. Don't hang forever if
+        // that notify gets dropped or the device wedges right at the end.
+        ackTimer = setTimeout(() => {
+          cleanup();
+          reject(new Error('device stopped responding (no save confirmation)'));
+        }, STALL_TIMEOUT_MS);
       } catch (err) {
         cleanup();
         reject(err);
@@ -486,12 +571,16 @@ async function connect() {
     await txChar.startNotifications();
 
     setConnected(true);
-    setMsg('Loading cards...');
-    cards = parseCardsBin(await getCardsBin());
+    showProgress(0, 'Loading cards...');
+    cards = parseCardsBin(await getCardsBin((received, total) => {
+      showProgress(total ? (received / total) * 100 : 0, `Loading cards... (${received}/${total} bytes)`);
+    }));
+    hideProgress();
     render();
     setMsg(`Loaded ${cards.length} card(s).`, 'ok');
     refreshStats();
   } catch (err) {
+    hideProgress();
     if (err.name !== 'NotFoundError') setMsg('Connect failed: ' + err.message, 'err');
     if (device) device.removeEventListener('gattserverdisconnected', onDisconnected);
     device = null; rxChar = null; txChar = null;
@@ -532,13 +621,14 @@ els.csvInput.addEventListener('change', async (e) => {
   }
 });
 
-els.saveBtn.addEventListener('click', async () => {
-  const clean = cards.map(c => ({ f: c.f.trim(), b: c.b.trim() })).filter(c => c.f || c.b);
+async function saveCardsToDevice(cardList) {
+  const clean = cardList.map(c => ({ f: c.f.trim(), b: c.b.trim() })).filter(c => c.f || c.b);
   els.saveBtn.disabled = true;
+  els.deleteAllBtn.disabled = true;
   showProgress(0, `Rendering card 0 of ${clean.length}...`);
   try {
     const bin = await buildCardsBin(clean, (done, total) => {
-      showProgress((done / total) * 70, `Rendering card ${done} of ${total}...`);
+      showProgress(total ? (done / total) * 70 : 70, `Rendering card ${done} of ${total}...`);
     });
     showProgress(75, 'Sending to device...');
     await putCardsBin(bin, (sent, total) => {
@@ -553,7 +643,16 @@ els.saveBtn.addEventListener('click', async () => {
     setMsg('Save failed: ' + err.message, 'err');
   } finally {
     els.saveBtn.disabled = false;
+    els.deleteAllBtn.disabled = false;
   }
+}
+
+els.saveBtn.addEventListener('click', () => saveCardsToDevice(cards));
+
+els.deleteAllBtn.addEventListener('click', () => {
+  if (cards.length === 0) { setMsg('No cards to delete.'); return; }
+  if (!confirm(`Delete all ${cards.length} card(s) from the device? This can't be undone.`)) return;
+  saveCardsToDevice([]);
 });
 
 // ---- Boot ----

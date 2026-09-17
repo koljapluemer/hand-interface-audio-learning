@@ -62,9 +62,13 @@
  *     device loads only per-card byte offsets into RAM and reads each
  *     bitmap from SD on demand when drawing, so deck size isn't RAM-bound.
  *
- * setup() calls BLEDevice::setMTU(247) so a fresh connection negotiates a
- * payload well above BLE_CHUNK; both sides assume that headroom rather than
- * probing the actual MTU.
+ * setup() calls BLEDevice::setMTU(247) so a fresh connection negotiates
+ * enough headroom for BLE_CHUNK (244 bytes, MTU-3) in one notify/write; both
+ * sides assume that headroom rather than probing the actual MTU. It also
+ * requests a short (7.5-15ms) connection interval right after connect, and
+ * the RX characteristic advertises write-without-response so sync.html can
+ * stream PUT bodies without waiting for a per-chunk ATT ack -- see
+ * ServerCallbacks::onConnect() and the RX characteristic properties below.
  *
  * Storage split, touch, power-latch and text rendering are unchanged from
  * 006 -- see that file's header for the pin/bus rationale. FONT_BIG/SMALL
@@ -210,18 +214,42 @@ static size_t queuePos = 0;        // index into `queue` of the card on screen
 #define NUS_RX_UUID      "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
 #define NUS_TX_UUID      "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
 
-static const size_t BLE_CHUNK = 180;   // payload bytes per notify/write; well
-                                        // under the MTU(247)-3 headroom below
+// NOTE: a device crash right after connect turned out to be caused by
+// sending (notify() in a retry loop) directly from within RxCallbacks::
+// onWrite() -- see PendingBleAction below for the real fix and explanation.
+// It was NOT this chunk size (244, the full MTU(247)-3 headroom, was tried
+// and still crashed; so did reverting to 180). Kept at 180, matching the
+// previously-stable value, since there's no evidence larger helps and no
+// reason to change two things at once right after finding the real cause.
+static const size_t BLE_CHUNK = 180;   // payload bytes per notify/write
 
 static BLEServer *pServer = nullptr;
 static BLECharacteristic *pTxCharacteristic = nullptr;
 static volatile bool bleConnected = false;
+// Set by TxCallbacks::onStatus() whenever a notify() call fails to queue
+// (stack congested / out of send buffers) -- sendFileOverBle() polls this to
+// back off and retry only when actually needed, instead of a fixed per-chunk
+// delay that would throttle every send whether or not it was necessary.
+static volatile bool notifyCongested = false;
 
 enum RxState { RX_IDLE, RX_BODY };
 static RxState rxState = RX_IDLE;
 static std::vector<uint8_t> rxBuffer;
 static size_t rxExpected = 0;
 static size_t rxReceived = 0;
+
+// RxCallbacks::onWrite() runs on the NimBLE host task, inside that task's
+// own (comparatively small) stack frame for the callback. Calling back into
+// the BLE stack from there -- e.g. a loop of retried notify() calls to send
+// a whole file -- is a documented cause of stack overflow crashes on this
+// stack (confirmed here: reliably crashed right after connect, regardless
+// of chunk size or connection params, with no visible backtrace because a
+// stack overflow corrupts the very stack the panic handler would unwind).
+// So onWrite() only ever sets one of these flags; the actual send/finish
+// work happens in syncLoop() on the main Arduino task instead, which has a
+// normal-sized stack and isn't nested inside a BLE callback at all.
+enum PendingBleAction { PENDING_NONE, PENDING_SEND_CARDS, PENDING_SEND_STATE, PENDING_FINISH_PUT };
+static volatile PendingBleAction pendingAction = PENDING_NONE;
 
 static inline size_t minSize(size_t a, size_t b) { return a < b ? a : b; }
 
@@ -664,6 +692,28 @@ static void handlePowerButton() {
 
 // ---- BLE protocol: GET (send /cards.bin), GET state (send /state.tsv,
 // read-only, for the sync page's stats panel), and PUT (overwrite cards) ----
+// Sends one notify payload, retrying with a short backoff if the local send
+// queue is momentarily full (see TxCallbacks::onStatus() / notifyCongested
+// below), and always yielding a little even on the fast path -- this loop
+// can run on the NimBLE host task itself (called synchronously from
+// RxCallbacks::onWrite()), so a long run with no yield at all risks
+// starving the watchdog. Returns false if the client disconnected mid-retry
+// so the caller can give up instead of retrying forever.
+static bool sendChunkReliably(const uint8_t *data, size_t n) {
+  for (;;) {
+    if (!bleConnected) return false;
+    notifyCongested = false;
+    pTxCharacteristic->setValue(data, n);
+    pTxCharacteristic->notify();
+    if (notifyCongested) {
+      delay(15);   // stack briefly out of send buffers; back off and retry
+      continue;    // this same chunk, instead of throttling every chunk
+    }
+    delay(2);
+    return true;
+  }
+}
+
 static void sendFileOverBle(const char *path, uint8_t cmd) {
   std::vector<uint8_t> content;
   if (sdOk) {
@@ -683,16 +733,25 @@ static void sendFileOverBle(const char *path, uint8_t cmd) {
   header[2] = (uint8_t)((total >> 8) & 0xFF);
   header[3] = (uint8_t)((total >> 16) & 0xFF);
   header[4] = (uint8_t)((total >> 24) & 0xFF);
-  pTxCharacteristic->setValue(header, sizeof(header));
-  pTxCharacteristic->notify();
+  // This header notify used to be a single unretried notify() call -- if it
+  // happened to queue right when the stack was momentarily busy (plausible
+  // right after a fresh connection), it was silently dropped, and the app
+  // would misparse the first body chunk as the header and reject the whole
+  // transfer with "unexpected reply from device". Route it through the same
+  // retry path as the body chunks below.
+  if (!sendChunkReliably(header, sizeof(header))) {
+    Serial.printf("BLE: aborted send (%s), client disconnected\n", path);
+    return;
+  }
 
   size_t sent = 0;
   while (sent < total) {
     size_t n = minSize(BLE_CHUNK, total - sent);
-    pTxCharacteristic->setValue(data + sent, n);
-    pTxCharacteristic->notify();
+    if (!sendChunkReliably(data + sent, n)) {
+      Serial.printf("BLE: aborted send (%s), client disconnected\n", path);
+      return;
+    }
     sent += n;
-    delay(15);   // let the BLE stack drain the notify queue between packets
   }
   Serial.printf("BLE: sent %u bytes (%s)\n", (unsigned)total, path);
 }
@@ -715,13 +774,24 @@ static void finishPut() {
                 (unsigned)rxBuffer.size(), ok ? "ok" : "FAILED");
 
   uint8_t resp[2] = { 0x02, (uint8_t)(ok ? 0x00 : 0x01) };
-  pTxCharacteristic->setValue(resp, sizeof(resp));
-  pTxCharacteristic->notify();
+  sendChunkReliably(resp, sizeof(resp));
 
   rxState = RX_IDLE;
   rxBuffer.clear();
   rxBuffer.shrink_to_fit();
 }
+
+// notify() (see BLECharacteristic::notify() in the Arduino BLE library) is
+// fire-and-forget: it queues the packet with the NimBLE host stack and calls
+// onStatus() synchronously with whether that queuing succeeded, before any
+// actual over-the-air send happens. ERROR_GATT here means the stack's send
+// buffers are full -- that's the only case sendFileOverBle() needs to back
+// off for.
+class TxCallbacks : public BLECharacteristicCallbacks {
+  void onStatus(BLECharacteristic *pCharacteristic, Status s, uint32_t code) override {
+    if (s != SUCCESS_NOTIFY && s != SUCCESS_INDICATE) notifyCongested = true;
+  }
+};
 
 class RxCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *pCharacteristic) override {
@@ -731,23 +801,23 @@ class RxCallbacks : public BLECharacteristicCallbacks {
 
     if (rxState == RX_IDLE) {
       if (data[0] == 0x01) {                       // GET
-        sendCardsOverBle();
+        pendingAction = PENDING_SEND_CARDS;         // actual send: syncLoop()
       } else if (data[0] == 0x03) {                 // GET state (stats)
-        sendStateOverBle();
+        pendingAction = PENDING_SEND_STATE;         // actual send: syncLoop()
       } else if (data[0] == 0x02 && len >= 5) {     // PUT header
         uint32_t total = (uint32_t)data[1] | ((uint32_t)data[2] << 8) |
                           ((uint32_t)data[3] << 16) | ((uint32_t)data[4] << 24);
         rxExpected = total;
         rxReceived = 0;
         rxBuffer.assign(total, 0);
-        if (total == 0) finishPut();
+        if (total == 0) pendingAction = PENDING_FINISH_PUT;   // actual finish: syncLoop()
         else rxState = RX_BODY;
       }
     } else {   // RX_BODY: raw body bytes, no framing
       size_t n = minSize(len, rxExpected - rxReceived);
       memcpy(rxBuffer.data() + rxReceived, data, n);
       rxReceived += n;
-      if (rxReceived >= rxExpected) finishPut();
+      if (rxReceived >= rxExpected) pendingAction = PENDING_FINISH_PUT;   // actual finish: syncLoop()
     }
   }
 };
@@ -759,6 +829,13 @@ class ServerCallbacks : public BLEServerCallbacks {
     rxBuffer.clear();
     rxBuffer.shrink_to_fit();
     Serial.println("BLE: central connected");
+    // NOTE: used to also call pServer->requestConnParams() here to ask for a
+    // shorter connection interval. Removed after it looked like the crash
+    // trigger; turned out the real cause was elsewhere (see PendingBleAction
+    // above -- notify() called synchronously from a BLE host callback), but
+    // calling back into the GAP API from within onConnect() is the same
+    // class of risk, so this stays out unless it's revisited deliberately,
+    // deferred to syncLoop() the same way sends now are.
   }
   void onDisconnect(BLEServer *pServer) override {
     bleConnected = false;
@@ -778,6 +855,19 @@ static void syncLoop() {
     if (bleConnected != lastConnected) {
       lastConnected = bleConnected;
       drawSyncStatus(bleConnected ? "Connected!" : "Waiting for connection...");
+    }
+
+    // Do the actual BLE send/finish work here, on the main task, instead of
+    // inside RxCallbacks::onWrite() -- see PendingBleAction's declaration
+    // for why. Snapshot-and-clear before dispatching in case the action
+    // itself takes a while and bleConnected/rxState change during it.
+    PendingBleAction action = pendingAction;
+    pendingAction = PENDING_NONE;
+    switch (action) {
+      case PENDING_SEND_CARDS: sendCardsOverBle(); break;
+      case PENDING_SEND_STATE: sendStateOverBle(); break;
+      case PENDING_FINISH_PUT: finishPut(); break;
+      case PENDING_NONE: break;
     }
 
     int x, y;
@@ -804,8 +894,14 @@ static void enterSyncMode() {
 
   pTxCharacteristic = service->createCharacteristic(NUS_TX_UUID, BLECharacteristic::PROPERTY_NOTIFY);
   pTxCharacteristic->addDescriptor(new BLE2902());
+  pTxCharacteristic->setCallbacks(new TxCallbacks());
 
-  BLECharacteristic *rxChar = service->createCharacteristic(NUS_RX_UUID, BLECharacteristic::PROPERTY_WRITE);
+  // WRITE_NR (write-without-response) alongside WRITE: sync.html uses WRITE
+  // for the single-byte commands and the PUT header (needs the ATT-level
+  // ack for ordering/reliability) but WRITE_NR for PUT body chunks, which
+  // skips the per-chunk round trip and is the main lever on the upload side.
+  BLECharacteristic *rxChar = service->createCharacteristic(
+    NUS_RX_UUID, BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
   rxChar->setCallbacks(new RxCallbacks());
 
   service->start();
