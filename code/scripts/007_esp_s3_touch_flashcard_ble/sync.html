@@ -43,6 +43,16 @@
   </div>
 
   <div id="app" hidden>
+    <div class="card bg-base-100 shadow-sm mb-4">
+      <div class="card-body p-3">
+        <div class="flex items-center gap-2 mb-1">
+          <span class="font-semibold text-sm">Learning stats</span>
+          <button id="statsBtn" class="btn btn-ghost btn-xs ml-auto">Refresh</button>
+        </div>
+        <div id="statsBody" class="text-sm text-base-content/70">Loading...</div>
+      </div>
+    </div>
+
     <div class="flex flex-wrap items-center gap-2 mb-4">
       <button id="addBtn" class="btn btn-primary btn-sm">+ Add card</button>
       <label class="btn btn-outline btn-sm">
@@ -99,6 +109,8 @@ const els = {
   addBtn: document.getElementById('addBtn'),
   csvInput: document.getElementById('csvInput'),
   saveBtn: document.getElementById('saveBtn'),
+  statsBtn: document.getElementById('statsBtn'),
+  statsBody: document.getElementById('statsBody'),
   msg: document.getElementById('msg'),
   list: document.getElementById('list'),
   empty: document.getElementById('empty'),
@@ -154,13 +166,13 @@ function readU32LE(b, off) {
   return b[off] | (b[off + 1] << 8) | (b[off + 2] << 16) | (b[off + 3] << 24);
 }
 
-async function getCards() {
+function getFile(cmdByte) {
   return new Promise((resolve, reject) => {
     let total = null, received = 0, buf = null;
     const onNotify = (e) => {
       const bytes = toBytes(e.target.value);
       if (total === null) {
-        if (bytes.length < 5 || bytes[0] !== 0x01) {
+        if (bytes.length < 5 || bytes[0] !== cmdByte) {
           cleanup(); reject(new Error('unexpected reply from device')); return;
         }
         total = readU32LE(bytes, 1);
@@ -179,8 +191,46 @@ async function getCards() {
     };
     function cleanup() { txChar.removeEventListener('characteristicvaluechanged', onNotify); }
     txChar.addEventListener('characteristicvaluechanged', onNotify);
-    writeRaw(new Uint8Array([0x01])).catch((err) => { cleanup(); reject(err); });
+    writeRaw(new Uint8Array([cmdByte])).catch((err) => { cleanup(); reject(err); });
   });
+}
+
+function getCards() { return getFile(0x01); }
+function getState() { return getFile(0x03); }   // /state.tsv, read-only
+
+// ---- Learning stats (parses /state.tsv: front\tback\tbox\tpracticed) ----
+function parseStateStats(text) {
+  let unpracticed = 0;
+  const boxCounts = {};
+  text.split('\n').forEach((line) => {
+    if (!line) return;
+    const lastTab = line.lastIndexOf('\t');
+    if (lastTab < 0) return;
+    const boxTab = line.lastIndexOf('\t', lastTab - 1);
+    if (boxTab < 0) return;
+    const practiced = line.slice(lastTab + 1);
+    const box = line.slice(boxTab + 1, lastTab);
+    if (practiced === '0') { unpracticed++; return; }
+    boxCounts[box] = (boxCounts[box] || 0) + 1;
+  });
+  return { unpracticed, boxCounts };
+}
+
+function renderStats(stats) {
+  const boxes = Object.keys(stats.boxCounts).map(Number).sort((a, b) => a - b);
+  const parts = [`Unpracticed: ${stats.unpracticed}`];
+  boxes.forEach((b) => parts.push(`Box ${b}: ${stats.boxCounts[b]}`));
+  els.statsBody.textContent = parts.join('   ·   ');
+}
+
+async function refreshStats() {
+  if (!txChar) return;
+  els.statsBody.textContent = 'Loading...';
+  try {
+    renderStats(parseStateStats(await getState()));
+  } catch (err) {
+    els.statsBody.textContent = 'Stats unavailable: ' + err.message;
+  }
 }
 
 async function putCards(text) {
@@ -267,6 +317,7 @@ async function connect() {
     });
     render();
     setMsg(`Loaded ${cards.length} card(s).`, 'ok');
+    refreshStats();
   } catch (err) {
     if (err.name !== 'NotFoundError') setMsg('Connect failed: ' + err.message, 'err');
     if (device) device.removeEventListener('gattserverdisconnected', onDisconnected);
@@ -285,6 +336,8 @@ els.connectBtn.addEventListener('click', () => {
   if (device && device.gatt.connected) disconnect();
   else connect();
 });
+
+els.statsBtn.addEventListener('click', refreshStats);
 
 els.addBtn.addEventListener('click', () => {
   cards.push({ f: '', b: '' });

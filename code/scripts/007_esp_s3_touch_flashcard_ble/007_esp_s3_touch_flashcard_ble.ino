@@ -40,6 +40,12 @@
  *   PUT response (device -> app): one notify with [0x02, status], status 0
  *     = saved OK, 1 = error (no SD / write failed).
  *
+ *   STAT GET (app -> device): single byte 0x03. Read-only debug/interest
+ *     stats for the sync page: sends /state.tsv (front\tback\tbox\tpracticed
+ *     per line, one per card) -- see the scheduler section below.
+ *   STAT GET response (device -> app): one notify with [0x03, len:u32 LE],
+ *     then chunks of raw state.tsv bytes, same framing as the cards GET.
+ *
  * setup() calls BLEDevice::setMTU(247) so a fresh connection negotiates a
  * payload well above BLE_CHUNK; both sides assume that headroom rather than
  * probing the actual MTU.
@@ -151,10 +157,19 @@ static Screen    screen = SCREEN_CARD;
 static CardPhase phase  = PHASE_PROMPT;
 
 // ---- Flashcards (loaded from SD) ----
-struct Flashcard { String front, back; };
+struct Flashcard { String front, back; int box; bool practiced; };
 static std::vector<Flashcard> cards;
 static int  currentIndex = 0;
 static bool sdOk = false;
+
+// ---- Scheduler: session queue over `cards`, by index into that vector ----
+static const int NEW_CARDS_PER_SESSION = 12;
+static const int BUBBLE_PASSES         = 2;
+static const int INCORRECT_DELAY_MIN   = 4;   // reappear in 4..7 trials
+static const int INCORRECT_DELAY_MAX   = 7;
+
+static std::vector<int> queue;     // play order for this session
+static size_t queuePos = 0;        // index into `queue` of the card on screen
 
 // ---- BLE (Nordic UART Service) ----
 #define DEVICE_NAME      "Flashcards"
@@ -411,6 +426,8 @@ static bool loadCards() {
     c.front = line.substring(0, t);  c.front.trim();
     c.back  = line.substring(t + 1); c.back.trim();
     if (c.front.isEmpty() && c.back.isEmpty()) continue;
+    c.box = 0;
+    c.practiced = false;
     cards.push_back(c);
   }
   f.close();
@@ -418,8 +435,139 @@ static bool loadCards() {
   return !cards.empty();
 }
 
-static void pickNextCard() {
-  currentIndex = cards.empty() ? 0 : (int)random(0, (long)cards.size());
+// ---- Scheduler state (box + practiced flag per card) ----
+// Kept in its own file, separate from cards.tsv, so the BLE sync page --
+// which only ever reads/writes plain front\tback rows -- can never see or
+// clobber it. Reconciled against the current `cards` by front+back match,
+// so edits/adds/removes made via sync just fall out of the match on the
+// next boot instead of corrupting anything.
+static void loadState() {
+  File f = SD_MMC.open("/state.tsv", FILE_READ);
+  if (!f) { Serial.println("no /state.tsv yet (fresh deck)"); return; }
+
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.replace("\r", "");
+    if (line.isEmpty()) continue;
+
+    // Parse from the right (...front\tback\tbox\tpracticed) so an
+    // embedded tab in front/back, however unlikely, can't desync the count.
+    int lastTab = line.lastIndexOf('\t');
+    if (lastTab < 0) continue;
+    int boxTab = line.lastIndexOf('\t', lastTab - 1);
+    if (boxTab < 0) continue;
+    String practicedStr = line.substring(lastTab + 1);
+    String boxStr       = line.substring(boxTab + 1, lastTab);
+    String frontBack     = line.substring(0, boxTab);
+
+    int fbTab = frontBack.indexOf('\t');
+    if (fbTab < 0) continue;
+    String front = frontBack.substring(0, fbTab);      front.trim();
+    String back  = frontBack.substring(fbTab + 1);     back.trim();
+
+    for (auto &c : cards) {
+      if (c.front == front && c.back == back) {
+        c.box = boxStr.toInt();
+        c.practiced = practicedStr.toInt() != 0;
+        break;
+      }
+    }
+  }
+  f.close();
+}
+
+static void saveState() {
+  if (!sdOk) return;
+  File f = SD_MMC.open("/state.tsv", FILE_WRITE);   // "w" -> truncates
+  if (!f) { Serial.println("state save FAILED (no SD?)"); return; }
+  for (auto &c : cards) {
+    f.print(c.front); f.print('\t');
+    f.print(c.back);  f.print('\t');
+    f.print(c.box);   f.print('\t');
+    f.println(c.practiced ? 1 : 0);
+  }
+  f.close();
+}
+
+// ---- Session queue: initial order on boot ----
+static void shuffleQueue(std::vector<int> &q) {
+  for (int i = (int)q.size() - 1; i > 0; i--) {
+    int j = random(0, i + 1);
+    int t = q[i]; q[i] = q[j]; q[j] = t;
+  }
+}
+
+// Fully random shuffle, then an intentionally incomplete (2-pass) bubble
+// sort by box, so lower-box items tend to end up earlier on average -- a
+// gentle bias, not a real sort. Never-practiced cards are skipped by every
+// comparison they're part of, so they stay wherever the shuffle put them;
+// box changes made during the session only affect ordering starting next
+// boot, never mid-session.
+static void buildSessionQueue() {
+  queue.clear();
+  queuePos = 0;
+  if (cards.empty()) return;
+
+  // Only the next NEW_CARDS_PER_SESSION never-practiced cards (in deck
+  // order) join the queue this session; the rest sit out entirely until a
+  // future boot introduces them.
+  std::vector<int> newIdx;
+  for (int i = 0; i < (int)cards.size() && (int)newIdx.size() < NEW_CARDS_PER_SESSION; i++) {
+    if (!cards[i].practiced) newIdx.push_back(i);
+  }
+  for (int i = 0; i < (int)cards.size(); i++) {
+    if (cards[i].practiced) queue.push_back(i);
+  }
+  for (int idx : newIdx) queue.push_back(idx);
+
+  shuffleQueue(queue);
+
+  for (int pass = 0; pass < BUBBLE_PASSES; pass++) {
+    for (size_t i = 0; i + 1 < queue.size(); i++) {
+      int a = queue[i], b = queue[i + 1];
+      if (!cards[a].practiced || !cards[b].practiced) continue;   // new cards stay put
+      if (cards[a].box > cards[b].box) { queue[i] = b; queue[i + 1] = a; }
+    }
+  }
+
+  currentIndex = queue[queuePos];
+}
+
+// ---- In-session grading ----
+// Box/practiced persist to SD immediately; list position is session-only
+// (a fresh shuffle+sort happens every boot, so there's nothing to save).
+static void gradeCorrect() {
+  if (queue.empty()) return;
+  int idx = queue[queuePos];
+  cards[idx].box++;
+  cards[idx].practiced = true;
+  saveState();
+
+  queue.erase(queue.begin() + queuePos);
+  // After removing the graded card, whatever slid into queuePos (if
+  // anything) is the next card to show; if it was the last card, wrap.
+  size_t nextPos = (queuePos < queue.size()) ? queuePos : 0;
+  queue.push_back(idx);   // appending never shifts indices <= nextPos
+  queuePos = nextPos;
+  currentIndex = queue[queuePos];
+}
+
+static void gradeIncorrect() {
+  if (queue.empty()) return;
+  int idx = queue[queuePos];
+  cards[idx].box = max(0, cards[idx].box - 2);
+  cards[idx].practiced = true;
+  saveState();
+
+  queue.erase(queue.begin() + queuePos);
+  size_t nextPos = (queuePos < queue.size()) ? queuePos : 0;
+  int delay = random(INCORRECT_DELAY_MIN, INCORRECT_DELAY_MAX + 1);
+  size_t insertPos = minSize(nextPos + (size_t)delay, queue.size());
+  queue.insert(queue.begin() + insertPos, idx);   // insertPos >= nextPos, so
+                                                   // the element at nextPos
+                                                   // is never shifted by this
+  queuePos = nextPos;
+  currentIndex = queue[queuePos];
 }
 
 // ---- Power button (works on the game loop and the sync loop) ----
@@ -447,18 +595,19 @@ static void handlePowerButton() {
   }
 }
 
-// ---- BLE protocol: GET (send /cards.tsv) and PUT (overwrite it) ----
-static void sendCardsOverBle() {
+// ---- BLE protocol: GET (send /cards.tsv), GET state (send /state.tsv,
+// read-only, for the sync page's stats panel), and PUT (overwrite cards) ----
+static void sendFileOverBle(const char *path, uint8_t cmd) {
   String content;
   if (sdOk) {
-    File f = SD_MMC.open("/cards.tsv", FILE_READ);
+    File f = SD_MMC.open(path, FILE_READ);
     if (f) { content = f.readString(); f.close(); }
   }
   size_t total = content.length();
   const uint8_t *data = (const uint8_t *)content.c_str();
 
   uint8_t header[5];
-  header[0] = 0x01;
+  header[0] = cmd;
   header[1] = (uint8_t)(total & 0xFF);
   header[2] = (uint8_t)((total >> 8) & 0xFF);
   header[3] = (uint8_t)((total >> 16) & 0xFF);
@@ -474,8 +623,11 @@ static void sendCardsOverBle() {
     sent += n;
     delay(15);   // let the BLE stack drain the notify queue between packets
   }
-  Serial.printf("BLE: sent %u bytes (cards.tsv)\n", (unsigned)total);
+  Serial.printf("BLE: sent %u bytes (%s)\n", (unsigned)total, path);
 }
+
+static void sendCardsOverBle() { sendFileOverBle("/cards.tsv", 0x01); }
+static void sendStateOverBle() { sendFileOverBle("/state.tsv", 0x03); }
 
 static void finishPut() {
   bool ok = sdOk;
@@ -509,6 +661,8 @@ class RxCallbacks : public BLECharacteristicCallbacks {
     if (rxState == RX_IDLE) {
       if (data[0] == 0x01) {                       // GET
         sendCardsOverBle();
+      } else if (data[0] == 0x03) {                 // GET state (stats)
+        sendStateOverBle();
       } else if (data[0] == 0x02 && len >= 5) {     // PUT header
         uint32_t total = (uint32_t)data[1] | ((uint32_t)data[2] << 8) |
                           ((uint32_t)data[3] << 16) | ((uint32_t)data[4] << 24);
@@ -633,9 +787,13 @@ void setup() {
   }
 
   loadCards();
+  loadState();
 
   randomSeed(esp_random());
-  pickNextCard();
+  buildSessionQueue();
+  saveState();   // so /state.tsv (and the sync page's stats) are fresh even
+                  // before the first grade of the session, e.g. right after
+                  // a deck edit adds cards that were never graded before
   screen = SCREEN_CARD;
   phase  = PHASE_PROMPT;
   drawCardPrompt();
@@ -664,11 +822,11 @@ void loop() {
       if (y >= DIV_Y && x < MID_X) {
         flashBox(LEFT_BTN_X, BTN_Y, LEFT_BTN_W, BTN_H, "Wrong", FONT_SMALL);
         Serial.println("-> Wrong");
-        pickNextCard(); phase = PHASE_PROMPT; drawCardPrompt();
+        gradeIncorrect(); phase = PHASE_PROMPT; drawCardPrompt();
       } else if (y >= DIV_Y && x >= MID_X) {
         flashBox(RIGHT_BTN_X, BTN_Y, RIGHT_BTN_W, BTN_H, "Correct", FONT_SMALL);
         Serial.println("-> Correct");
-        pickNextCard(); phase = PHASE_PROMPT; drawCardPrompt();
+        gradeCorrect(); phase = PHASE_PROMPT; drawCardPrompt();
       }
     } else if (screen == SCREEN_SETTINGS) {
       if (inRect(x, y, SET_SYNC_X, SET_SYNC_Y, SET_SYNC_W, SET_SYNC_H)) {
