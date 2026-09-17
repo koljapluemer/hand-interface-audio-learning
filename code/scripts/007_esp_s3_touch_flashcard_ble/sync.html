@@ -1,0 +1,335 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Flashcards BLE Sync</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link href="https://cdn.jsdelivr.net/npm/daisyui@4/dist/full.min.css" rel="stylesheet" type="text/css">
+</head>
+<body class="min-h-screen bg-base-200">
+
+<div class="navbar bg-base-100 shadow sticky top-0 z-10">
+  <div class="flex-1 px-2">
+    <span class="text-lg font-semibold">Flashcards</span>
+  </div>
+  <div class="flex-none gap-2 px-2">
+    <span id="statusBadge" class="badge badge-ghost">Not connected</span>
+    <button id="connectBtn" class="btn btn-primary btn-sm">Connect</button>
+  </div>
+</div>
+
+<main class="max-w-2xl mx-auto p-4">
+
+  <div id="unsupported" class="alert alert-warning mb-4 flex-col items-start" hidden>
+    <span>
+      Web Bluetooth isn't available in this browser/page. iOS Safari has no
+      Web Bluetooth support at all; on desktop/Android, check:
+    </span>
+    <ul class="list-disc list-inside text-sm">
+      <li>
+        This page must be served over <strong>https://</strong> or
+        <strong>http://localhost</strong> &mdash; not opened as a
+        <code>file://</code> path (check the address bar).
+      </li>
+      <li id="linuxFlagHint">
+        On <strong>Linux</strong>, Chrome/Chromium ships Web Bluetooth behind
+        a flag: open
+        <code class="select-all">chrome://flags/#enable-web-bluetooth</code>
+        (copy/paste it into the address bar, Chrome blocks links to it),
+        set it to <strong>Enabled</strong>, then relaunch the browser.
+      </li>
+    </ul>
+  </div>
+
+  <div id="app" hidden>
+    <div class="flex flex-wrap items-center gap-2 mb-4">
+      <button id="addBtn" class="btn btn-primary btn-sm">+ Add card</button>
+      <label class="btn btn-outline btn-sm">
+        Import CSV
+        <input id="csvInput" type="file" accept=".csv,text/csv,text/plain" class="hidden">
+      </label>
+      <button id="saveBtn" class="btn btn-success btn-sm ml-auto">Save to device</button>
+    </div>
+
+    <div id="msg" class="text-sm min-h-5 mb-3"></div>
+
+    <ul id="list" class="flex flex-col gap-2"></ul>
+    <p id="empty" class="text-center text-base-content/60 py-10" hidden>
+      No cards yet. Add one or import a CSV.
+    </p>
+  </div>
+
+  <div id="idle" class="text-center text-base-content/60 py-16">
+    Tap <strong>Connect</strong>, then pick <strong>Flashcards</strong> from
+    the Bluetooth device list. On the device: gear icon &rarr; Settings &rarr;
+    Sync mode.
+  </div>
+
+</main>
+
+<template id="cardRowTpl">
+  <li class="card bg-base-100 shadow-sm">
+    <div class="card-body p-3 grid grid-cols-1 sm:grid-cols-[1fr_1fr_auto] gap-2 items-center">
+      <input class="input input-bordered input-sm f" placeholder="Front">
+      <input class="input input-bordered input-sm b" placeholder="Back">
+      <button class="btn btn-ghost btn-sm text-error del">Delete</button>
+    </div>
+  </li>
+</template>
+
+<script>
+'use strict';
+
+// ---- BLE contract (must match 007_esp_s3_touch_flashcard_ble.ino) ----
+const SERVICE_UUID = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+const RX_UUID      = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';   // app -> device
+const TX_UUID      = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';   // device -> app
+const CHUNK = 180;   // must match BLE_CHUNK on the device
+
+let device = null, rxChar = null, txChar = null;
+let cards = [];   // [{f, b}]
+
+const els = {
+  connectBtn: document.getElementById('connectBtn'),
+  statusBadge: document.getElementById('statusBadge'),
+  unsupported: document.getElementById('unsupported'),
+  app: document.getElementById('app'),
+  idle: document.getElementById('idle'),
+  addBtn: document.getElementById('addBtn'),
+  csvInput: document.getElementById('csvInput'),
+  saveBtn: document.getElementById('saveBtn'),
+  msg: document.getElementById('msg'),
+  list: document.getElementById('list'),
+  empty: document.getElementById('empty'),
+  rowTpl: document.getElementById('cardRowTpl'),
+};
+
+function setMsg(text, kind) {
+  els.msg.textContent = text || '';
+  els.msg.className = 'text-sm min-h-5 mb-3' +
+    (kind === 'err' ? ' text-error' : kind === 'ok' ? ' text-success' : ' text-base-content/60');
+}
+
+function setConnected(isConnected) {
+  els.statusBadge.textContent = isConnected ? 'Connected' : 'Not connected';
+  els.statusBadge.className = 'badge ' + (isConnected ? 'badge-success' : 'badge-ghost');
+  els.connectBtn.textContent = isConnected ? 'Disconnect' : 'Connect';
+  els.app.hidden = !isConnected;
+  els.idle.hidden = isConnected;
+}
+
+function render() {
+  els.list.innerHTML = '';
+  els.empty.hidden = cards.length > 0;
+  cards.forEach((c, i) => {
+    const li = els.rowTpl.content.firstElementChild.cloneNode(true);
+    const f = li.querySelector('.f');
+    const b = li.querySelector('.b');
+    f.value = c.f; b.value = c.b;
+    f.addEventListener('input', () => cards[i].f = f.value);
+    b.addEventListener('input', () => cards[i].b = b.value);
+    li.querySelector('.del').addEventListener('click', () => { cards.splice(i, 1); render(); });
+    els.list.appendChild(li);
+  });
+}
+
+// ---- Low-level BLE write/notify plumbing ----
+async function writeRaw(bytes) {
+  if (rxChar.writeValueWithResponse) await rxChar.writeValueWithResponse(bytes);
+  else await rxChar.writeValue(bytes);
+}
+
+async function writeChunked(bytes) {
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    await writeRaw(bytes.slice(i, i + CHUNK));
+  }
+}
+
+function toBytes(dataView) {
+  return new Uint8Array(dataView.buffer, dataView.byteOffset, dataView.byteLength);
+}
+
+function readU32LE(b, off) {
+  return b[off] | (b[off + 1] << 8) | (b[off + 2] << 16) | (b[off + 3] << 24);
+}
+
+async function getCards() {
+  return new Promise((resolve, reject) => {
+    let total = null, received = 0, buf = null;
+    const onNotify = (e) => {
+      const bytes = toBytes(e.target.value);
+      if (total === null) {
+        if (bytes.length < 5 || bytes[0] !== 0x01) {
+          cleanup(); reject(new Error('unexpected reply from device')); return;
+        }
+        total = readU32LE(bytes, 1);
+        buf = new Uint8Array(total);
+        const rest = bytes.subarray(5);
+        buf.set(rest, 0);
+        received = rest.length;
+      } else {
+        buf.set(bytes, received);
+        received += bytes.length;
+      }
+      if (received >= total) {
+        cleanup();
+        resolve(new TextDecoder('utf-8').decode(buf));
+      }
+    };
+    function cleanup() { txChar.removeEventListener('characteristicvaluechanged', onNotify); }
+    txChar.addEventListener('characteristicvaluechanged', onNotify);
+    writeRaw(new Uint8Array([0x01])).catch((err) => { cleanup(); reject(err); });
+  });
+}
+
+async function putCards(text) {
+  const body = new TextEncoder().encode(text);
+  const header = new Uint8Array(5);
+  header[0] = 0x02;
+  header[1] = body.length & 0xff;
+  header[2] = (body.length >> 8) & 0xff;
+  header[3] = (body.length >> 16) & 0xff;
+  header[4] = (body.length >> 24) & 0xff;
+
+  return new Promise((resolve, reject) => {
+    const onNotify = (e) => {
+      const bytes = toBytes(e.target.value);
+      if (bytes.length >= 2 && bytes[0] === 0x02) {
+        cleanup();
+        bytes[1] === 0 ? resolve() : reject(new Error('device reported a save error (no SD card?)'));
+      }
+    };
+    function cleanup() { txChar.removeEventListener('characteristicvaluechanged', onNotify); }
+    txChar.addEventListener('characteristicvaluechanged', onNotify);
+    (async () => {
+      try {
+        await writeRaw(header);
+        await writeChunked(body);
+      } catch (err) {
+        cleanup();
+        reject(err);
+      }
+    })();
+  });
+}
+
+// ---- CSV import (headerless, front,back; same rules as the 006 web UI) ----
+function parseCSV(text) {
+  const out = [];
+  let row = [], field = '', q = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (q) {
+      if (ch === '"') { if (text[i + 1] === '"') { field += '"'; i++; } else q = false; }
+      else field += ch;
+    } else if (ch === '"') q = true;
+    else if (ch === ',') { row.push(field); field = ''; }
+    else if (ch === '\n' || ch === '\r') {
+      if (ch === '\r' && text[i + 1] === '\n') i++;
+      row.push(field); field = '';
+      if (row.some(x => x !== '')) out.push(row);
+      row = [];
+    } else field += ch;
+  }
+  if (field !== '' || row.length) { row.push(field); if (row.some(x => x !== '')) out.push(row); }
+  return out.map(r => ({ f: (r[0] || '').trim(), b: (r[1] || '').trim() }));
+}
+
+// ---- Connect / disconnect ----
+function onDisconnected() {
+  device = null; rxChar = null; txChar = null;
+  setConnected(false);
+  setMsg('Disconnected.');
+}
+
+async function connect() {
+  try {
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ services: [SERVICE_UUID] }],
+      optionalServices: [SERVICE_UUID],
+    });
+    device.addEventListener('gattserverdisconnected', onDisconnected);
+
+    setMsg('Connecting...');
+    const gattServer = await device.gatt.connect();
+    const service = await gattServer.getPrimaryService(SERVICE_UUID);
+    rxChar = await service.getCharacteristic(RX_UUID);
+    txChar = await service.getCharacteristic(TX_UUID);
+    await txChar.startNotifications();
+
+    setConnected(true);
+    setMsg('Loading cards...');
+    const tsv = await getCards();
+    cards = tsv.split('\n').filter(l => l !== '').map(l => {
+      const i = l.indexOf('\t');
+      return i < 0 ? { f: l, b: '' } : { f: l.slice(0, i), b: l.slice(i + 1) };
+    });
+    render();
+    setMsg(`Loaded ${cards.length} card(s).`, 'ok');
+  } catch (err) {
+    if (err.name !== 'NotFoundError') setMsg('Connect failed: ' + err.message, 'err');
+    if (device) device.removeEventListener('gattserverdisconnected', onDisconnected);
+    device = null; rxChar = null; txChar = null;
+    setConnected(false);
+  }
+}
+
+function disconnect() {
+  if (device && device.gatt.connected) device.gatt.disconnect();
+  else onDisconnected();
+}
+
+// ---- Wire up UI ----
+els.connectBtn.addEventListener('click', () => {
+  if (device && device.gatt.connected) disconnect();
+  else connect();
+});
+
+els.addBtn.addEventListener('click', () => {
+  cards.push({ f: '', b: '' });
+  render();
+  els.list.lastElementChild.querySelector('input').focus();
+});
+
+els.csvInput.addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  e.target.value = '';
+  if (!file) return;
+  try {
+    const rows = parseCSV(await file.text());
+    cards = cards.concat(rows);
+    render();
+    setMsg(`Imported ${rows.length} card(s). Review, then Save.`, 'ok');
+  } catch (err) {
+    setMsg('Import failed: ' + err.message, 'err');
+  }
+});
+
+els.saveBtn.addEventListener('click', async () => {
+  const clean = cards.map(c => ({ f: c.f.trim(), b: c.b.trim() })).filter(c => c.f || c.b);
+  const tsv = clean.map(c => c.f + '\t' + c.b).join('\n');
+  setMsg('Saving...');
+  try {
+    await putCards(tsv);
+    cards = clean;
+    render();
+    setMsg(`Saved ${clean.length} card(s) to the SD card. Tap Restart on the device.`, 'ok');
+  } catch (err) {
+    setMsg('Save failed: ' + err.message, 'err');
+  }
+});
+
+// ---- Boot ----
+if (!navigator.bluetooth) {
+  els.unsupported.hidden = false;
+  els.connectBtn.disabled = true;
+  els.idle.hidden = true;
+  const isLinux = /Linux/.test(navigator.userAgent) && !/Android/.test(navigator.userAgent);
+  document.getElementById('linuxFlagHint').hidden = !isLinux;
+} else {
+  setConnected(false);
+}
+</script>
+</body>
+</html>
