@@ -6,6 +6,12 @@
 <title>Flashcards BLE Sync</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <link href="https://cdn.jsdelivr.net/npm/daisyui@4/dist/full.min.css" rel="stylesheet" type="text/css">
+<!-- Script fonts for card-content rendering (see FONT_STACK below). Add a
+     family here + to FONT_STACK to support another script; nothing else
+     needs to change, on this page or the device. -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans:wght@400;700&family=Noto+Sans+Arabic:wght@400;700&family=Noto+Sans+SC:wght@400;700&family=Noto+Sans+JP:wght@400;700&family=Noto+Sans+KR:wght@400;700&family=Noto+Sans+Devanagari:wght@400;700&family=Noto+Sans+Hebrew:wght@400;700&display=block" rel="stylesheet">
 </head>
 <body class="min-h-screen bg-base-200">
 
@@ -97,6 +103,20 @@ const RX_UUID      = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';   // app -> device
 const TX_UUID      = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';   // device -> app
 const CHUNK = 180;   // must match BLE_CHUNK on the device
 
+// ---- Card bitmap format (must match BMP_W/BMP_H and the /cards.bin layout
+// in 007_esp_s3_touch_flashcard_ble.ino) ----
+const BMP_W = 190, BMP_H = 36;
+const BMP_ROW_BYTES = Math.ceil(BMP_W / 8);
+const BMP_BYTES = BMP_ROW_BYTES * BMP_H;
+const CARDS_MAGIC = 'FCB1';
+
+// Script coverage for rendering card text to bitmaps -- add a Google Fonts
+// family here (and to the <link> in <head>) to support another script; you
+// don't need to pick one per card, the browser falls back through this list
+// per-character automatically.
+const FONT_STACK = '"Noto Sans","Noto Sans Arabic","Noto Sans SC","Noto Sans JP","Noto Sans KR","Noto Sans Devanagari","Noto Sans Hebrew",sans-serif';
+const FONT_FAMILIES = ['Noto Sans', 'Noto Sans Arabic', 'Noto Sans SC', 'Noto Sans JP', 'Noto Sans KR', 'Noto Sans Devanagari', 'Noto Sans Hebrew'];
+
 let device = null, rxChar = null, txChar = null;
 let cards = [];   // [{f, b}]
 
@@ -146,6 +166,125 @@ function render() {
   });
 }
 
+// ---- Card text -> 1bpp bitmap (all script/shaping work happens here, via
+// the browser's own text-layout engine -- the device never sees a font) ----
+let fontsReady = null;
+function ensureFontsReady() {
+  if (!fontsReady) {
+    fontsReady = Promise.all(FONT_FAMILIES.map((fam) => document.fonts.load(`16px "${fam}"`)))
+      .then(() => document.fonts.ready);
+  }
+  return fontsReady;
+}
+
+const renderCanvas = document.createElement('canvas');
+renderCanvas.width = BMP_W;
+renderCanvas.height = BMP_H;
+const rctx = renderCanvas.getContext('2d', { willReadFrequently: true });
+
+// Packs thresholded ImageData (pure black/white pixels) into MSB-first,
+// byte-per-row-padded 1bpp -- exactly what Adafruit_GFX::drawBitmap() wants.
+function packBits(imgData) {
+  const out = new Uint8Array(BMP_ROW_BYTES * BMP_H);
+  const d = imgData.data;
+  for (let y = 0; y < BMP_H; y++) {
+    for (let x = 0; x < BMP_W; x++) {
+      const black = d[(y * BMP_W + x) * 4] < 128;
+      if (black) out[y * BMP_ROW_BYTES + (x >> 3)] |= 0x80 >> (x & 7);
+    }
+  }
+  return out;
+}
+
+// Plain black/white threshold -- looks cleaner than error-diffusion dithering
+// for small text. If you ever want Atkinson/Floyd-Steinberg/Bayer instead
+// (e.g. for a script that renders thin at small sizes), pull in a dithering
+// lib and swap the call in renderTextTo1bpp() below; a CDN ES-module import
+// was tried here first but esm.sh's CORS/MIME behavior proved flaky enough
+// across browsers that it wasn't worth it for one function this small.
+function thresholdImageData(imgData, level) {
+  const d = imgData.data;
+  for (let i = 0; i < d.length; i += 4) {
+    const v = d[i] < level ? 0 : 255;
+    d[i] = d[i + 1] = d[i + 2] = v;
+  }
+  return imgData;
+}
+
+// Renders `text` centered-vertically, left-aligned, shrinking the font until
+// it fits the box (falling back to horizontal squeeze via fillText's
+// maxWidth for pathological cases), then thresholds to black/white.
+function renderTextTo1bpp(text) {
+  rctx.clearRect(0, 0, BMP_W, BMP_H);
+  rctx.fillStyle = '#fff';
+  rctx.fillRect(0, 0, BMP_W, BMP_H);
+  if (text) {
+    rctx.fillStyle = '#000';
+    rctx.textBaseline = 'middle';
+    rctx.textAlign = 'left';
+    const maxWidth = BMP_W - 4;
+    let size = BMP_H - 6;
+    rctx.font = `${size}px ${FONT_STACK}`;
+    while (size > 8 && rctx.measureText(text).width > maxWidth) {
+      size -= 1;
+      rctx.font = `${size}px ${FONT_STACK}`;
+    }
+    rctx.fillText(text, 2, BMP_H / 2, maxWidth);
+  }
+  const imgData = rctx.getImageData(0, 0, BMP_W, BMP_H);
+  return packBits(thresholdImageData(imgData, 128));
+}
+
+// ---- /cards.bin binary format: see the header comment in the .ino ----
+function buildCardsBin(cardList) {
+  const enc = new TextEncoder();
+  const parts = [];
+  const header = new Uint8Array(8);
+  header.set(enc.encode(CARDS_MAGIC), 0);
+  header[4] = BMP_W & 0xff;       header[5] = (BMP_W >> 8) & 0xff;
+  header[6] = BMP_H & 0xff;       header[7] = (BMP_H >> 8) & 0xff;
+  parts.push(header);
+
+  for (const c of cardList) {
+    const frontText = enc.encode(c.f), backText = enc.encode(c.b);
+    const lenPair = (n) => new Uint8Array([n & 0xff, (n >> 8) & 0xff]);
+    parts.push(
+      lenPair(frontText.length), frontText,
+      lenPair(backText.length), backText,
+      renderTextTo1bpp(c.f), renderTextTo1bpp(c.b),
+    );
+  }
+
+  const total = parts.reduce((n, p) => n + p.length, 0);
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const p of parts) { out.set(p, off); off += p.length; }
+  return out;
+}
+
+function parseCardsBin(bytes) {
+  if (bytes.length === 0) return [];
+  const magic = String.fromCharCode(...bytes.subarray(0, 4));
+  if (bytes.length < 8 || magic !== CARDS_MAGIC) {
+    throw new Error('unrecognized /cards.bin header (old firmware or corrupt file?)');
+  }
+  const bmpW = bytes[4] | (bytes[5] << 8);
+  const bmpH = bytes[6] | (bytes[7] << 8);
+  const bmpBytes = Math.ceil(bmpW / 8) * bmpH;
+  const dec = new TextDecoder('utf-8');
+  const out = [];
+  let off = 8;
+  while (off + 2 <= bytes.length) {
+    const frontLen = bytes[off] | (bytes[off + 1] << 8); off += 2;
+    const front = dec.decode(bytes.subarray(off, off + frontLen)); off += frontLen;
+    const backLen = bytes[off] | (bytes[off + 1] << 8); off += 2;
+    const back = dec.decode(bytes.subarray(off, off + backLen)); off += backLen;
+    off += bmpBytes * 2;   // skip stored bitmaps -- re-rendered fresh on save
+    out.push({ f: front, b: back });
+  }
+  return out;
+}
+
 // ---- Low-level BLE write/notify plumbing ----
 async function writeRaw(bytes) {
   if (rxChar.writeValueWithResponse) await rxChar.writeValueWithResponse(bytes);
@@ -166,7 +305,7 @@ function readU32LE(b, off) {
   return b[off] | (b[off + 1] << 8) | (b[off + 2] << 16) | (b[off + 3] << 24);
 }
 
-function getFile(cmdByte) {
+function getFileBytes(cmdByte) {
   return new Promise((resolve, reject) => {
     let total = null, received = 0, buf = null;
     const onNotify = (e) => {
@@ -186,7 +325,7 @@ function getFile(cmdByte) {
       }
       if (received >= total) {
         cleanup();
-        resolve(new TextDecoder('utf-8').decode(buf));
+        resolve(buf);
       }
     };
     function cleanup() { txChar.removeEventListener('characteristicvaluechanged', onNotify); }
@@ -195,8 +334,12 @@ function getFile(cmdByte) {
   });
 }
 
-function getCards() { return getFile(0x01); }
-function getState() { return getFile(0x03); }   // /state.tsv, read-only
+async function getFileText(cmdByte) {
+  return new TextDecoder('utf-8').decode(await getFileBytes(cmdByte));
+}
+
+function getCardsBin() { return getFileBytes(0x01); }
+function getState() { return getFileText(0x03); }   // /state.tsv, read-only
 
 // ---- Learning stats (parses /state.tsv: front\tback\tbox\tpracticed) ----
 function parseStateStats(text) {
@@ -233,8 +376,7 @@ async function refreshStats() {
   }
 }
 
-async function putCards(text) {
-  const body = new TextEncoder().encode(text);
+async function putCardsBin(body) {
   const header = new Uint8Array(5);
   header[0] = 0x02;
   header[1] = body.length & 0xff;
@@ -310,11 +452,7 @@ async function connect() {
 
     setConnected(true);
     setMsg('Loading cards...');
-    const tsv = await getCards();
-    cards = tsv.split('\n').filter(l => l !== '').map(l => {
-      const i = l.indexOf('\t');
-      return i < 0 ? { f: l, b: '' } : { f: l.slice(0, i), b: l.slice(i + 1) };
-    });
+    cards = parseCardsBin(await getCardsBin());
     render();
     setMsg(`Loaded ${cards.length} card(s).`, 'ok');
     refreshStats();
@@ -361,10 +499,12 @@ els.csvInput.addEventListener('change', async (e) => {
 
 els.saveBtn.addEventListener('click', async () => {
   const clean = cards.map(c => ({ f: c.f.trim(), b: c.b.trim() })).filter(c => c.f || c.b);
-  const tsv = clean.map(c => c.f + '\t' + c.b).join('\n');
-  setMsg('Saving...');
+  setMsg('Rendering card bitmaps...');
   try {
-    await putCards(tsv);
+    await ensureFontsReady();
+    const bin = buildCardsBin(clean);
+    setMsg('Saving...');
+    await putCardsBin(bin);
     cards = clean;
     render();
     setMsg(`Saved ${clean.length} card(s) to the SD card. Tap Restart on the device.`, 'ok');
@@ -382,6 +522,7 @@ if (!navigator.bluetooth) {
   document.getElementById('linuxFlagHint').hidden = !isLinux;
 } else {
   setConnected(false);
+  ensureFontsReady();   // warm the font cache in the background, before Save needs it
 }
 </script>
 </body>

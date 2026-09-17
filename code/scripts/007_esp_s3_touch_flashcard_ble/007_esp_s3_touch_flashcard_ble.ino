@@ -27,15 +27,15 @@
  *
  * The RX/TX pair carries a tiny framed protocol instead of raw HTTP, since a
  * single BLE attribute value is capped at 512 bytes and the negotiated MTU
- * can be much smaller than the whole cards.tsv:
+ * can be much smaller than the whole cards.bin:
  *
  *   GET (app -> device): single byte 0x01.
  *   GET response (device -> app): one notify with [0x01, len:u32 LE], then
- *     as many notifies as needed carrying raw cards.tsv bytes, chunked at
+ *     as many notifies as needed carrying raw cards.bin bytes, chunked at
  *     BLE_CHUNK bytes, until `len` bytes have been sent.
  *   PUT (app -> device): one write with [0x02, len:u32 LE], then as many
  *     writes as needed carrying raw body bytes (chunked at BLE_CHUNK), until
- *     `len` bytes have been sent. Device overwrites /cards.tsv with the
+ *     `len` bytes have been sent. Device overwrites /cards.bin with the
  *     reassembled body.
  *   PUT response (device -> app): one notify with [0x02, status], status 0
  *     = saved OK, 1 = error (no SD / write failed).
@@ -46,12 +46,30 @@
  *   STAT GET response (device -> app): one notify with [0x03, len:u32 LE],
  *     then chunks of raw state.tsv bytes, same framing as the cards GET.
  *
+ * The GET/PUT framing above is content-agnostic (it just moves the bytes of
+ * a path), which is what lets /cards.bin be a binary format instead of text:
+ *
+ *   /cards.bin: [magic "FCB1"][u16 bmpW LE][u16 bmpH LE], then per card
+ *     [u16 frontTextLen][frontText UTF-8][u16 backTextLen][backText UTF-8]
+ *     [frontBitmap][backBitmap], each bitmap bmpW x bmpH, 1bpp, MSB-first,
+ *     rows padded to a byte -- i.e. exactly what Adafruit_GFX::drawBitmap()
+ *     wants. The front/back text is carried along only so /state.tsv's
+ *     box/practiced matching (by front+back string) keeps working; the
+ *     device never renders it -- sync.html renders both fields to canvas
+ *     (so the browser's font/shaping stack, not u8g2, handles Arabic
+ *     joining, Vietnamese diacritics, CJK, etc.) and ships pre-dithered
+ *     pixels. bmpW/bmpH in the header must match BMP_W/BMP_H below; the
+ *     device loads only per-card byte offsets into RAM and reads each
+ *     bitmap from SD on demand when drawing, so deck size isn't RAM-bound.
+ *
  * setup() calls BLEDevice::setMTU(247) so a fresh connection negotiates a
  * payload well above BLE_CHUNK; both sides assume that headroom rather than
  * probing the actual MTU.
  *
  * Storage split, touch, power-latch and text rendering are unchanged from
- * 006 -- see that file's header for the pin/bus rationale.
+ * 006 -- see that file's header for the pin/bus rationale. FONT_BIG/SMALL
+ * now only draw fixed ASCII UI chrome (button labels, settings/sync text);
+ * card front/back are pre-rendered bitmaps, see /cards.bin above.
  *
  * Libraries: GxEPD2, U8g2_for_Adafruit_GFX, and the ESP32 Arduino core's
  * bundled BLE library (BLEDevice/BLEServer/BLE2902 -- no extra install,
@@ -63,6 +81,7 @@
 #include <Wire.h>
 #include <SPI.h>
 #include <math.h>
+#include <cstring>
 #include <vector>
 #include <GxEPD2_BW.h>
 #include <U8g2_for_Adafruit_GFX.h>
@@ -72,8 +91,9 @@
 #include <BLE2902.h>
 #include "SD_MMC.h"
 
-// Big font for the front row / back row; small font for button labels and the
-// settings/sync text. Both "_tf" fonts cover ASCII + Latin-1 Supplement.
+// UI chrome only (button labels, settings/sync text, "No flashcards"
+// message) -- all fixed ASCII strings. Card front/back are pre-rendered
+// bitmaps from sync.html, see the /cards.bin note in the header comment.
 static const uint8_t *FONT_BIG   = u8g2_font_9x15_tf;
 static const uint8_t *FONT_SMALL = u8g2_font_6x12_tf;
 
@@ -111,10 +131,16 @@ static const uint8_t FT6336_ADDR = 0x38;
 static const int W = 200, H = 200;
 static const int MID_X = W / 2;
 
+// Card content: pre-rendered 1bpp bitmaps from sync.html (see /cards.bin in
+// the header comment), blitted at fixed positions instead of drawn as text.
+static const int BMP_W = 190, BMP_H = 36;
+static const int BMP_ROW_BYTES = (BMP_W + 7) / 8;
+static const size_t BMP_BYTES = (size_t)BMP_ROW_BYTES * BMP_H;
+static const int FRONT_BMP_X = 5, FRONT_BMP_Y = 4;    // front row (prompt + answer)
+static const int BACK_BMP_X  = 5, BACK_BMP_Y  = 58;   // back/translation row (answer only)
+
 // Card screen (matches the 005/006 layout).
-static const int ROW_WORD_Y = 32;   // big font, front
 static const int DASH_Y     = 52;
-static const int ROW_MEAN_Y = 84;   // big font, back (answer state)
 static const int DIV_Y      = 112;
 static const int BTN_Y = DIV_Y + 4;
 static const int BTN_H = H - DIV_Y - 8;
@@ -157,7 +183,14 @@ static Screen    screen = SCREEN_CARD;
 static CardPhase phase  = PHASE_PROMPT;
 
 // ---- Flashcards (loaded from SD) ----
-struct Flashcard { String front, back; int box; bool practiced; };
+// front/back text is kept only for /state.tsv matching, never rendered; the
+// bitmaps themselves stay on SD and are read on demand by their byte offset
+// into /cards.bin so RAM use doesn't grow with deck size.
+struct Flashcard {
+  String front, back;
+  int box; bool practiced;
+  uint32_t frontBmpOffset, backBmpOffset;
+};
 static std::vector<Flashcard> cards;
 static int  currentIndex = 0;
 static bool sdOk = false;
@@ -289,6 +322,20 @@ static void flashBox(int x, int y, int w, int h, const char *label, const uint8_
   u8f.setForegroundColor(GxEPD_BLACK);
 }
 
+// Reads one card's bitmap from /cards.bin into `bmpBuf` and blits it. No-op
+// (leaves the area blank) on any SD hiccup rather than drawing garbage.
+// Defined here, ahead of loadCards()/the SD-backed Flashcard struct below,
+// only to sit next to the screen-drawing functions that call it.
+static uint8_t bmpBuf[BMP_BYTES];
+static void drawCardBitmap(uint32_t offset, int x, int y) {
+  File f = SD_MMC.open("/cards.bin", FILE_READ);
+  if (!f) return;
+  if (f.seek(offset) && f.read(bmpBuf, BMP_BYTES) == BMP_BYTES) {
+    display.drawBitmap(x, y, bmpBuf, BMP_W, BMP_H, GxEPD_BLACK);
+  }
+  f.close();
+}
+
 // ---- Screen drawing ----
 static void drawCardPrompt() {
   display.setFullWindow();
@@ -302,9 +349,7 @@ static void drawCardPrompt() {
       printCentered(MID_X, 94, "Tap the gear, then");
       printCentered(MID_X, 110, "\"Sync mode\", to add some.");
     } else {
-      selectFont(FONT_BIG);
-      u8f.setCursor(6, ROW_WORD_Y);
-      u8f.print(cards[currentIndex].front);
+      drawCardBitmap(cards[currentIndex].frontBmpOffset, FRONT_BMP_X, FRONT_BMP_Y);
 
       display.drawLine(0, DIV_Y, W - 1, DIV_Y, GxEPD_BLACK);
       display.drawRect(WIDE_BTN_X, BTN_Y, WIDE_BTN_W, BTN_H, GxEPD_BLACK);
@@ -322,15 +367,9 @@ static void drawCardAnswer() {
   do {
     display.fillScreen(GxEPD_WHITE);
 
-    selectFont(FONT_BIG);
-    u8f.setCursor(6, ROW_WORD_Y);
-    u8f.print(cards[currentIndex].front);
-
+    drawCardBitmap(cards[currentIndex].frontBmpOffset, FRONT_BMP_X, FRONT_BMP_Y);
     drawDashedLine(DASH_Y);
-
-    selectFont(FONT_BIG);
-    u8f.setCursor(6, ROW_MEAN_Y);
-    u8f.print(cards[currentIndex].back);
+    drawCardBitmap(cards[currentIndex].backBmpOffset, BACK_BMP_X, BACK_BMP_Y);
 
     display.drawLine(0, DIV_Y, W - 1, DIV_Y, GxEPD_BLACK);
     display.drawLine(MID_X, DIV_Y, MID_X, H - 1, GxEPD_BLACK);
@@ -412,20 +451,48 @@ static void drawFatalSd() {
 }
 
 // ---- Card data ----
+// Reads a u16-LE length prefix followed by that many UTF-8 bytes into a
+// null-terminated buffer, returns false on short read (truncated/corrupt file).
+static bool readLenPrefixedString(File &f, String &out) {
+  uint8_t lenBuf[2];
+  if (f.read(lenBuf, 2) != 2) return false;
+  uint16_t len = lenBuf[0] | ((uint16_t)lenBuf[1] << 8);
+  std::vector<char> buf(len + 1);
+  if (len > 0 && f.read((uint8_t *)buf.data(), len) != len) return false;
+  buf[len] = '\0';
+  out = String(buf.data());
+  return true;
+}
+
 static bool loadCards() {
   cards.clear();
-  File f = SD_MMC.open("/cards.tsv", FILE_READ);
-  if (!f) { Serial.println("no /cards.tsv yet"); return false; }
+  File f = SD_MMC.open("/cards.bin", FILE_READ);
+  if (!f) { Serial.println("no /cards.bin yet"); return false; }
+
+  uint8_t hdr[8];
+  if (f.read(hdr, 8) != 8 || memcmp(hdr, "FCB1", 4) != 0) {
+    Serial.println("cards.bin: missing/bad header");
+    f.close();
+    return false;
+  }
+  uint16_t bmpW = hdr[4] | ((uint16_t)hdr[5] << 8);
+  uint16_t bmpH = hdr[6] | ((uint16_t)hdr[7] << 8);
+  if (bmpW != BMP_W || bmpH != BMP_H) {
+    Serial.printf("cards.bin: bitmap size %ux%u != expected %dx%d, ignoring\n",
+                  bmpW, bmpH, BMP_W, BMP_H);
+    f.close();
+    return false;
+  }
+
   while (f.available()) {
-    String line = f.readStringUntil('\n');
-    line.replace("\r", "");
-    if (line.isEmpty()) continue;
-    int t = line.indexOf('\t');
-    if (t < 0) continue;
     Flashcard c;
-    c.front = line.substring(0, t);  c.front.trim();
-    c.back  = line.substring(t + 1); c.back.trim();
-    if (c.front.isEmpty() && c.back.isEmpty()) continue;
+    if (!readLenPrefixedString(f, c.front)) break;
+    if (!readLenPrefixedString(f, c.back)) break;
+
+    c.frontBmpOffset = f.position();
+    c.backBmpOffset  = c.frontBmpOffset + BMP_BYTES;
+    if (!f.seek(c.backBmpOffset + BMP_BYTES)) break;   // truncated record
+
     c.box = 0;
     c.practiced = false;
     cards.push_back(c);
@@ -436,7 +503,7 @@ static bool loadCards() {
 }
 
 // ---- Scheduler state (box + practiced flag per card) ----
-// Kept in its own file, separate from cards.tsv, so the BLE sync page --
+// Kept in its own file, separate from cards.bin, so the BLE sync page --
 // which only ever reads/writes plain front\tback rows -- can never see or
 // clobber it. Reconciled against the current `cards` by front+back match,
 // so edits/adds/removes made via sync just fall out of the match on the
@@ -595,16 +662,20 @@ static void handlePowerButton() {
   }
 }
 
-// ---- BLE protocol: GET (send /cards.tsv), GET state (send /state.tsv,
+// ---- BLE protocol: GET (send /cards.bin), GET state (send /state.tsv,
 // read-only, for the sync page's stats panel), and PUT (overwrite cards) ----
 static void sendFileOverBle(const char *path, uint8_t cmd) {
-  String content;
+  std::vector<uint8_t> content;
   if (sdOk) {
     File f = SD_MMC.open(path, FILE_READ);
-    if (f) { content = f.readString(); f.close(); }
+    if (f) {
+      content.resize(f.size());
+      if (!content.empty()) f.read(content.data(), content.size());
+      f.close();
+    }
   }
-  size_t total = content.length();
-  const uint8_t *data = (const uint8_t *)content.c_str();
+  size_t total = content.size();
+  const uint8_t *data = content.data();
 
   uint8_t header[5];
   header[0] = cmd;
@@ -626,13 +697,13 @@ static void sendFileOverBle(const char *path, uint8_t cmd) {
   Serial.printf("BLE: sent %u bytes (%s)\n", (unsigned)total, path);
 }
 
-static void sendCardsOverBle() { sendFileOverBle("/cards.tsv", 0x01); }
+static void sendCardsOverBle() { sendFileOverBle("/cards.bin", 0x01); }
 static void sendStateOverBle() { sendFileOverBle("/state.tsv", 0x03); }
 
 static void finishPut() {
   bool ok = sdOk;
   if (ok) {
-    File f = SD_MMC.open("/cards.tsv", FILE_WRITE);   // "w" -> truncates
+    File f = SD_MMC.open("/cards.bin", FILE_WRITE);   // "w" -> truncates
     if (!f) {
       ok = false;
     } else {
@@ -640,7 +711,7 @@ static void finishPut() {
       f.close();
     }
   }
-  Serial.printf("BLE: wrote /cards.tsv (%u bytes) -> %s\n",
+  Serial.printf("BLE: wrote /cards.bin (%u bytes) -> %s\n",
                 (unsigned)rxBuffer.size(), ok ? "ok" : "FAILED");
 
   uint8_t resp[2] = { 0x02, (uint8_t)(ok ? 0x00 : 0x01) };
