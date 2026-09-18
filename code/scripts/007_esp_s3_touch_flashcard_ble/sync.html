@@ -106,12 +106,11 @@ const RX_UUID      = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';   // app -> device
 const TX_UUID      = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';   // device -> app
 const CHUNK = 180;   // must match BLE_CHUNK on the device (244 crashed the device -- see .ino)
 
-// ---- Card bitmap format (must match BMP_W/BMP_H and the /cards.bin layout
-// in 007_esp_s3_touch_flashcard_ble.ino) ----
+// ---- Card bitmap format (must match BMP_W/BMP_H and the /cards/<id>.bin
+// layout in 007_esp_s3_touch_flashcard_ble.ino) ----
 const BMP_W = 190, BMP_H = 36;
 const BMP_ROW_BYTES = Math.ceil(BMP_W / 8);
 const BMP_BYTES = BMP_ROW_BYTES * BMP_H;
-const CARDS_MAGIC = 'FCB1';
 
 // Script coverage for rendering card text to bitmaps. "Noto Sans" alone
 // already covers Latin/Cyrillic/Greek/Vietnamese, so it's the baseline for
@@ -139,7 +138,8 @@ function fontStackFor(text) {
 }
 
 let device = null, rxChar = null, txChar = null;
-let cards = [];   // [{f, b}]
+let cards = [];            // [{id, f, b, box, practiced, dirty, isNew}] -- id 0 = not yet on device
+let pendingDeletes = [];   // ids removed locally, not yet sent to the device
 
 const els = {
   connectBtn: document.getElementById('connectBtn'),
@@ -192,9 +192,13 @@ function render() {
     const f = li.querySelector('.f');
     const b = li.querySelector('.b');
     f.value = c.f; b.value = c.b;
-    f.addEventListener('input', () => cards[i].f = f.value);
-    b.addEventListener('input', () => cards[i].b = b.value);
-    li.querySelector('.del').addEventListener('click', () => { cards.splice(i, 1); render(); });
+    f.addEventListener('input', () => { cards[i].f = f.value; cards[i].dirty = true; });
+    b.addEventListener('input', () => { cards[i].b = b.value; cards[i].dirty = true; });
+    li.querySelector('.del').addEventListener('click', () => {
+      if (cards[i].id) pendingDeletes.push(cards[i].id);   // id 0 = never uploaded, nothing to delete on-device
+      cards.splice(i, 1);
+      render();
+    });
     els.list.appendChild(li);
   });
 }
@@ -266,31 +270,13 @@ async function renderTextTo1bpp(text) {
   return packBits(thresholdImageData(imgData, 128));
 }
 
-// ---- /cards.bin binary format: see the header comment in the .ino ----
-// `onProgress(done, total)`, if given, fires after each card is rendered.
-async function buildCardsBin(cardList, onProgress) {
-  const enc = new TextEncoder();
-  const parts = [];
-  const header = new Uint8Array(8);
-  header.set(enc.encode(CARDS_MAGIC), 0);
-  header[4] = BMP_W & 0xff;       header[5] = (BMP_W >> 8) & 0xff;
-  header[6] = BMP_H & 0xff;       header[7] = (BMP_H >> 8) & 0xff;
-  parts.push(header);
-
-  for (let i = 0; i < cardList.length; i++) {
-    const c = cardList[i];
-    const frontText = enc.encode(c.f), backText = enc.encode(c.b);
-    const lenPair = (n) => new Uint8Array([n & 0xff, (n >> 8) & 0xff]);
-    const frontBmp = await renderTextTo1bpp(c.f);
-    const backBmp = await renderTextTo1bpp(c.b);
-    parts.push(
-      lenPair(frontText.length), frontText,
-      lenPair(backText.length), backText,
-      frontBmp, backBmp,
-    );
-    if (onProgress) onProgress(i + 1, cardList.length);
-  }
-
+// ---- Little-endian byte-packing helpers (LIST replies and PUT_CARD/DELETE
+// headers all use these) ----
+function u16le(n) { return new Uint8Array([n & 0xff, (n >> 8) & 0xff]); }
+function u32le(n) {
+  return new Uint8Array([n & 0xff, (n >> 8) & 0xff, (n >> 16) & 0xff, (n >> 24) & 0xff]);
+}
+function concatBytes(...parts) {
   const total = parts.reduce((n, p) => n + p.length, 0);
   const out = new Uint8Array(total);
   let off = 0;
@@ -298,25 +284,22 @@ async function buildCardsBin(cardList, onProgress) {
   return out;
 }
 
-function parseCardsBin(bytes) {
-  if (bytes.length === 0) return [];
-  const magic = String.fromCharCode(...bytes.subarray(0, 4));
-  if (bytes.length < 8 || magic !== CARDS_MAGIC) {
-    throw new Error('unrecognized /cards.bin header (old firmware or corrupt file?)');
-  }
-  const bmpW = bytes[4] | (bytes[5] << 8);
-  const bmpH = bytes[6] | (bytes[7] << 8);
-  const bmpBytes = Math.ceil(bmpW / 8) * bmpH;
+// ---- LIST reply format: see the header comment in the .ino. Per card:
+// [id u32][box u16][practiced u8][frontLen u16][front][backLen u16][back]
+// -- no bitmaps, sync.html always re-renders those from text before upload. ----
+function parseListReply(bytes) {
   const dec = new TextDecoder('utf-8');
   const out = [];
-  let off = 8;
-  while (off + 2 <= bytes.length) {
+  let off = 0;
+  while (off + 9 <= bytes.length) {
+    const id = readU32LE(bytes, off); off += 4;
+    const box = bytes[off] | (bytes[off + 1] << 8); off += 2;
+    const practiced = bytes[off] !== 0; off += 1;
     const frontLen = bytes[off] | (bytes[off + 1] << 8); off += 2;
-    const front = dec.decode(bytes.subarray(off, off + frontLen)); off += frontLen;
+    const f = dec.decode(bytes.subarray(off, off + frontLen)); off += frontLen;
     const backLen = bytes[off] | (bytes[off + 1] << 8); off += 2;
-    const back = dec.decode(bytes.subarray(off, off + backLen)); off += backLen;
-    off += bmpBytes * 2;   // skip stored bitmaps -- re-rendered fresh on save
-    out.push({ f: front, b: back });
+    const b = dec.decode(bytes.subarray(off, off + backLen)); off += backLen;
+    out.push({ id, f, b, box, practiced, dirty: false, isNew: false });
   }
   return out;
 }
@@ -369,7 +352,7 @@ function readU32LE(b, off) {
 // disconnect listener, and always cleans both up via cleanup().
 const STALL_TIMEOUT_MS = 8000;
 
-function getFileBytes(cmdByte, onProgress) {
+function getChunkedReply(cmdByte, onProgress) {
   // Capture these locally: onDisconnected() (the page-wide handler) nulls
   // out the shared `device`/`txChar` variables as soon as it runs, and
   // since listeners fire in registration order, that handler (registered
@@ -425,28 +408,17 @@ function getFileBytes(cmdByte, onProgress) {
   });
 }
 
-async function getFileText(cmdByte, onProgress) {
-  return new TextDecoder('utf-8').decode(await getFileBytes(cmdByte, onProgress));
-}
+function getList(onProgress) { return getChunkedReply(0x10, onProgress); }
 
-function getCardsBin(onProgress) { return getFileBytes(0x01, onProgress); }
-function getState() { return getFileText(0x03); }   // /state.tsv, read-only
-
-// ---- Learning stats (parses /state.tsv: front\tback\tbox\tpracticed) ----
-function parseStateStats(text) {
+// ---- Learning stats: derived straight from `cards` (box/practiced come
+// from the device via LIST, so nothing separate to fetch or parse) ----
+function computeStats(cardList) {
   let unpracticed = 0;
   const boxCounts = {};
-  text.split('\n').forEach((line) => {
-    if (!line) return;
-    const lastTab = line.lastIndexOf('\t');
-    if (lastTab < 0) return;
-    const boxTab = line.lastIndexOf('\t', lastTab - 1);
-    if (boxTab < 0) return;
-    const practiced = line.slice(lastTab + 1);
-    const box = line.slice(boxTab + 1, lastTab);
-    if (practiced === '0') { unpracticed++; return; }
-    boxCounts[box] = (boxCounts[box] || 0) + 1;
-  });
+  for (const c of cardList) {
+    if (!c.practiced) { unpracticed++; continue; }
+    boxCounts[c.box] = (boxCounts[c.box] || 0) + 1;
+  }
   return { unpracticed, boxCounts };
 }
 
@@ -457,25 +429,28 @@ function renderStats(stats) {
   els.statsBody.textContent = parts.join('   ·   ');
 }
 
+// Re-issues LIST rather than just re-rendering the already-loaded `cards`:
+// box/practiced only ever change on-device (grading happens outside sync
+// mode), so a manual refresh is the only way this page can see fresher
+// state without a full reconnect.
 async function refreshStats() {
   if (!txChar) return;
   els.statsBody.textContent = 'Loading...';
   try {
-    renderStats(parseStateStats(await getState()));
+    cards = parseListReply(await getList());
+    render();
+    renderStats(computeStats(cards));
   } catch (err) {
     els.statsBody.textContent = 'Stats unavailable: ' + err.message;
   }
 }
 
-async function putCardsBin(body, onProgress) {
-  const header = new Uint8Array(5);
-  header[0] = 0x02;
-  header[1] = body.length & 0xff;
-  header[2] = (body.length >> 8) & 0xff;
-  header[3] = (body.length >> 16) & 0xff;
-  header[4] = (body.length >> 24) & 0xff;
-
-  // See getFileBytes() above for why: capture these now, since cleanup()
+// Generic PUT-style opcode: write `headerBytes`, stream `bodyBytes` chunked
+// (skipped if empty), then wait for a reply starting with `cmdByte`. Shared
+// by PUT_CARD/DELETE_CARD/DELETE_ALL -- same stall-timer/disconnect-handler
+// shape putCardsBin() used to have inline for just the one old PUT opcode.
+function putWithAck(cmdByte, headerBytes, bodyBytes, onProgress) {
+  // See getChunkedReply() above for why: capture these now, since cleanup()
   // must not read the mutable `device`/`txChar` globals (onDisconnected()
   // nulls them out before this function's own onDisconnect below runs).
   const dev = device, tx = txChar;
@@ -492,23 +467,23 @@ async function putCardsBin(body, onProgress) {
     }
     const onNotify = (e) => {
       const bytes = toBytes(e.target.value);
-      if (bytes.length >= 2 && bytes[0] === 0x02) {
+      if (bytes.length >= 2 && bytes[0] === cmdByte) {
         cleanup();
-        bytes[1] === 0 ? resolve() : reject(new Error('device reported a save error (no SD card?)'));
+        resolve(bytes);
       }
     };
     tx.addEventListener('characteristicvaluechanged', onNotify);
     dev.addEventListener('gattserverdisconnected', onDisconnect);
     (async () => {
       try {
-        await writeRaw(header);
-        await writeChunked(body, onProgress);
-        // All bytes are on the wire; only the device's SD write + ack notify
-        // are left, which should be near-instant. Don't hang forever if
-        // that notify gets dropped or the device wedges right at the end.
+        await writeRaw(headerBytes);
+        if (bodyBytes && bodyBytes.length) await writeChunked(bodyBytes, onProgress);
+        // All bytes are on the wire; only the device's SD write/delete + ack
+        // notify are left, which should be near-instant. Don't hang forever
+        // if that notify gets dropped or the device wedges right at the end.
         ackTimer = setTimeout(() => {
           cleanup();
-          reject(new Error('device stopped responding (no save confirmation)'));
+          reject(new Error('device stopped responding (no confirmation)'));
         }, STALL_TIMEOUT_MS);
       } catch (err) {
         cleanup();
@@ -516,6 +491,39 @@ async function putCardsBin(body, onProgress) {
       }
     })();
   });
+}
+
+async function putCard(card, onProgress) {
+  const frontBmp = await renderTextTo1bpp(card.f);
+  const backBmp = await renderTextTo1bpp(card.b);
+  const enc = new TextEncoder();
+  const frontText = enc.encode(card.f), backText = enc.encode(card.b);
+  const body = concatBytes(
+    u16le(frontText.length), frontText,
+    u16le(backText.length), backText,
+    frontBmp, backBmp,
+  );
+  const header = concatBytes(
+    new Uint8Array([0x11]),
+    u32le(card.id || 0),
+    u16le(card.box || 0),
+    new Uint8Array([card.practiced ? 1 : 0]),
+    u32le(body.length),
+  );
+  const ack = await putWithAck(0x11, header, body, onProgress);
+  if (ack[1] !== 0) throw new Error('device reported a save error for this card');
+  return readU32LE(ack, 2);   // assigned/confirmed id
+}
+
+async function deleteCard(id) {
+  const ack = await putWithAck(0x12, concatBytes(new Uint8Array([0x12]), u32le(id)), null);
+  if (ack[1] !== 0) throw new Error('device reported a delete error');
+}
+
+async function deleteAllCards() {
+  const ack = await putWithAck(0x13, new Uint8Array([0x13]), null);
+  if (ack[1] !== 0) throw new Error('device reported a delete-all error');
+  return readU32LE(ack, 2);   // deletedCount
 }
 
 // ---- CSV import (headerless, front,back; same rules as the 006 web UI) ----
@@ -564,13 +572,14 @@ async function connect() {
 
     setConnected(true);
     showProgress(0, 'Loading cards...');
-    cards = parseCardsBin(await getCardsBin((received, total) => {
+    cards = parseListReply(await getList((received, total) => {
       showProgress(total ? (received / total) * 100 : 0, `Loading cards... (${received}/${total} bytes)`);
     }));
+    pendingDeletes = [];
     hideProgress();
     render();
     setMsg(`Loaded ${cards.length} card(s).`, 'ok');
-    refreshStats();
+    renderStats(computeStats(cards));
   } catch (err) {
     hideProgress();
     if (err.name !== 'NotFoundError') setMsg('Connect failed: ' + err.message, 'err');
@@ -594,7 +603,7 @@ els.connectBtn.addEventListener('click', () => {
 els.statsBtn.addEventListener('click', refreshStats);
 
 els.addBtn.addEventListener('click', () => {
-  cards.push({ f: '', b: '' });
+  cards.push({ id: 0, f: '', b: '', box: 0, practiced: false, dirty: true, isNew: true });
   render();
   els.list.lastElementChild.querySelector('input').focus();
 });
@@ -604,7 +613,8 @@ els.csvInput.addEventListener('change', async (e) => {
   e.target.value = '';
   if (!file) return;
   try {
-    const rows = parseCSV(await file.text());
+    const rows = parseCSV(await file.text())
+      .map(r => ({ ...r, id: 0, box: 0, practiced: false, dirty: true, isNew: true }));
     cards = cards.concat(rows);
     render();
     setMsg(`Imported ${rows.length} card(s). Review, then Save.`, 'ok');
@@ -613,23 +623,38 @@ els.csvInput.addEventListener('change', async (e) => {
   }
 });
 
-async function saveCardsToDevice(cardList) {
-  const clean = cardList.map(c => ({ f: c.f.trim(), b: c.b.trim() })).filter(c => c.f || c.b);
+// Diff-based sync: only cards actually marked dirty (edited or new) get
+// re-rendered+uploaded, and only ids explicitly removed locally get
+// deleted -- unlike the old whole-deck replace, an edit to one card out of
+// a thousand no longer touches the other 999.
+async function saveCardsToDevice() {
+  const dirty = cards.filter(c => c.dirty && (c.f.trim() || c.b.trim()));
+  const toDelete = pendingDeletes.slice();
+  const total = dirty.length + toDelete.length;
+  if (total === 0) { setMsg('Nothing to save.'); return; }
+
   els.saveBtn.disabled = true;
   els.deleteAllBtn.disabled = true;
-  showProgress(0, `Rendering card 0 of ${clean.length}...`);
+  let done = 0;
   try {
-    const bin = await buildCardsBin(clean, (done, total) => {
-      showProgress(total ? (done / total) * 70 : 70, `Rendering card ${done} of ${total}...`);
-    });
-    showProgress(75, 'Sending to device...');
-    await putCardsBin(bin, (sent, total) => {
-      showProgress(75 + (sent / total) * 25, `Sending to device... (${sent}/${total} bytes)`);
-    });
-    cards = clean;
-    render();
+    for (const id of toDelete) {
+      showProgress((done / total) * 100, `Deleting card ${done + 1} of ${total}...`);
+      await deleteCard(id);
+      done++;
+    }
+    pendingDeletes = [];
+
+    for (const c of dirty) {
+      showProgress((done / total) * 100, `Saving card ${done + 1} of ${total}...`);
+      c.f = c.f.trim(); c.b = c.b.trim();
+      const assignedId = await putCard(c);
+      c.id = assignedId; c.dirty = false; c.isNew = false;
+      done++;
+    }
+
     hideProgress();
-    setMsg(`Saved ${clean.length} card(s) to the SD card. Tap Restart on the device.`, 'ok');
+    render();
+    setMsg(`Saved ${dirty.length} card(s), deleted ${toDelete.length}. Tap Restart on the device.`, 'ok');
   } catch (err) {
     hideProgress();
     setMsg('Save failed: ' + err.message, 'err');
@@ -639,12 +664,27 @@ async function saveCardsToDevice(cardList) {
   }
 }
 
-els.saveBtn.addEventListener('click', () => saveCardsToDevice(cards));
+els.saveBtn.addEventListener('click', () => saveCardsToDevice());
 
-els.deleteAllBtn.addEventListener('click', () => {
+els.deleteAllBtn.addEventListener('click', async () => {
   if (cards.length === 0) { setMsg('No cards to delete.'); return; }
   if (!confirm(`Delete all ${cards.length} card(s) from the device? This can't be undone.`)) return;
-  saveCardsToDevice([]);
+  els.saveBtn.disabled = true;
+  els.deleteAllBtn.disabled = true;
+  try {
+    showProgress(50, 'Deleting all cards...');
+    await deleteAllCards();
+    cards = []; pendingDeletes = [];
+    hideProgress();
+    render();
+    setMsg('Deleted all cards.', 'ok');
+  } catch (err) {
+    hideProgress();
+    setMsg('Delete failed: ' + err.message, 'err');
+  } finally {
+    els.saveBtn.disabled = false;
+    els.deleteAllBtn.disabled = false;
+  }
 });
 
 // ---- Boot ----

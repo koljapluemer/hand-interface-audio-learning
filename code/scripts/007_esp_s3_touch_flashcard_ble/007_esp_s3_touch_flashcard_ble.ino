@@ -25,55 +25,69 @@
  *   RX (write)  : 6E400002-B5A3-F393-E0A9-E50E24DCCA9E   app -> device
  *   TX (notify) : 6E400003-B5A3-F393-E0A9-E50E24DCCA9E   device -> app
  *
+ * Storage is one file per card, /cards/<id>.bin (id is the 8-hex-digit
+ * filename) -- so "what cards exist" is just "what files are in /cards/",
+ * no separate index/manifest file to fall out of sync with reality. Each
+ * file carries its own front/back text, bitmaps, AND box/practiced learning
+ * state together, so editing a card can never orphan its progress the way
+ * the old cards.bin+state.tsv split (matched by front+back text) could.
+ *
+ *   /cards/<id>.bin: [magic "FC01"][u32 id LE][u16 box LE][u8 practiced],
+ *     then [u16 frontLen LE][frontText UTF-8][u16 backLen LE][backText
+ *     UTF-8][frontBitmap][backBitmap], each bitmap BMP_W x BMP_H, 1bpp,
+ *     MSB-first, rows padded to a byte -- i.e. exactly what
+ *     Adafruit_GFX::drawBitmap() wants. The front/back text is carried
+ *     along purely as a courtesy to sync.html's edit UI; the device never
+ *     renders it -- sync.html renders both fields to canvas (so the
+ *     browser's font/shaping stack, not u8g2, handles Arabic joining,
+ *     Vietnamese diacritics, CJK, etc.) and ships pre-dithered pixels. The
+ *     in-file id is redundant with the filename and is only used to detect
+ *     (and log) a rename/write mismatch -- the filename is what
+ *     remove()/rename() actually target, so it's always treated as
+ *     authoritative, never the in-file copy.
+ *
  * The RX/TX pair carries a tiny framed protocol instead of raw HTTP, since a
  * single BLE attribute value is capped at 512 bytes and the negotiated MTU
- * can be much smaller than the whole cards.bin:
+ * can be much smaller than a whole card (or the whole deck):
  *
- *   GET (app -> device): single byte 0x01.
- *   GET response (device -> app): one notify with [0x01, len:u32 LE], then
- *     as many notifies as needed carrying raw cards.bin bytes, chunked at
- *     BLE_CHUNK bytes, until `len` bytes have been sent.
- *   PUT (app -> device): one write with [0x02, len:u32 LE], then as many
- *     writes as needed carrying raw body bytes (chunked at BLE_CHUNK), until
- *     `len` bytes have been sent. Device overwrites /cards.bin with the
- *     reassembled body.
- *   PUT response (device -> app): one notify with [0x02, status], status 0
- *     = saved OK, 1 = error (no SD / write failed).
+ *   LIST (app -> device): single byte 0x10. Device replies with one notify
+ *     [0x10, len:u32 LE] then chunks (BLE_CHUNK bytes each) of the
+ *     concatenated per-card records [id:u32 LE][box:u16 LE][practiced:u8]
+ *     [frontLen:u16 LE][front][backLen:u16 LE][back] for every card --
+ *     everything sync.html's edit UI needs, no bitmaps (sync.html always
+ *     re-renders bitmaps from text before any upload, so it never needs the
+ *     device's copy).
  *
- *   STAT GET (app -> device): single byte 0x03. Read-only debug/interest
- *     stats for the sync page: sends /state.tsv (front\tback\tbox\tpracticed
- *     per line, one per card) -- see the scheduler section below.
- *   STAT GET response (device -> app): one notify with [0x03, len:u32 LE],
- *     then chunks of raw state.tsv bytes, same framing as the cards GET.
+ *   PUT_CARD (app -> device): one write with [0x11, id:u32 LE, box:u16 LE,
+ *     practiced:u8, bodyLen:u32 LE] (id 0 = "assign me a new id"), then as
+ *     many writes as needed carrying raw body bytes (chunked at BLE_CHUNK)
+ *     -- [frontLen:u16 LE][front][backLen:u16 LE][back][frontBitmap]
+ *     [backBitmap] -- until bodyLen bytes have been sent. Device streams
+ *     the body straight to /cards/<id>.bin.tmp (never buffers a whole card
+ *     in RAM) and atomically renames it into place on success.
+ *   PUT_CARD response: one notify [0x11, status, assignedId:u32 LE].
+ *     status 0 = saved OK, 1 = error (no SD / write failed).
  *
- * The GET/PUT framing above is content-agnostic (it just moves the bytes of
- * a path), which is what lets /cards.bin be a binary format instead of text:
+ *   DELETE_CARD (app -> device): one write [0x12, id:u32 LE].
+ *   DELETE_CARD response: one notify [0x12, status].
  *
- *   /cards.bin: [magic "FCB1"][u16 bmpW LE][u16 bmpH LE], then per card
- *     [u16 frontTextLen][frontText UTF-8][u16 backTextLen][backText UTF-8]
- *     [frontBitmap][backBitmap], each bitmap bmpW x bmpH, 1bpp, MSB-first,
- *     rows padded to a byte -- i.e. exactly what Adafruit_GFX::drawBitmap()
- *     wants. The front/back text is carried along only so /state.tsv's
- *     box/practiced matching (by front+back string) keeps working; the
- *     device never renders it -- sync.html renders both fields to canvas
- *     (so the browser's font/shaping stack, not u8g2, handles Arabic
- *     joining, Vietnamese diacritics, CJK, etc.) and ships pre-dithered
- *     pixels. bmpW/bmpH in the header must match BMP_W/BMP_H below; the
- *     device loads only per-card byte offsets into RAM and reads each
- *     bitmap from SD on demand when drawing, so deck size isn't RAM-bound.
+ *   DELETE_ALL (app -> device): single byte 0x13.
+ *   DELETE_ALL response: one notify [0x13, status, deletedCount:u32 LE].
  *
  * setup() calls BLEDevice::setMTU(247) so a fresh connection negotiates
- * enough headroom for BLE_CHUNK (244 bytes, MTU-3) in one notify/write; both
- * sides assume that headroom rather than probing the actual MTU. It also
- * requests a short (7.5-15ms) connection interval right after connect, and
- * the RX characteristic advertises write-without-response so sync.html can
- * stream PUT bodies without waiting for a per-chunk ATT ack -- see
- * ServerCallbacks::onConnect() and the RX characteristic properties below.
+ * enough headroom, though BLE_CHUNK itself is kept at 180 (see its own
+ * comment -- 244, the full MTU(247)-3 headroom, was tried and crashed the
+ * device for unrelated reasons). It also requests a short (7.5-15ms)
+ * connection interval right after connect, and the RX characteristic
+ * advertises write-without-response so sync.html can stream PUT bodies
+ * without waiting for a per-chunk ATT ack -- see ServerCallbacks::onConnect()
+ * and the RX characteristic properties below.
  *
  * Storage split, touch, power-latch and text rendering are unchanged from
  * 006 -- see that file's header for the pin/bus rationale. FONT_BIG/SMALL
  * now only draw fixed ASCII UI chrome (button labels, settings/sync text);
- * card front/back are pre-rendered bitmaps, see /cards.bin above.
+ * card front/back are pre-rendered bitmaps, see the /cards/<id>.bin format
+ * above.
  *
  * Libraries: GxEPD2, U8g2_for_Adafruit_GFX, and the ESP32 Arduino core's
  * bundled BLE library (BLEDevice/BLEServer/BLE2902 -- no extra install,
@@ -87,6 +101,7 @@
 #include <math.h>
 #include <cstring>
 #include <vector>
+#include <algorithm>
 #include <GxEPD2_BW.h>
 #include <U8g2_for_Adafruit_GFX.h>
 #include <BLEDevice.h>
@@ -98,7 +113,7 @@
 
 // UI chrome only (button labels, settings/sync text, "No flashcards"
 // message) -- all fixed ASCII strings. Card front/back are pre-rendered
-// bitmaps from sync.html, see the /cards.bin note in the header comment.
+// bitmaps from sync.html, see the /cards/<id>.bin note in the header comment.
 static const uint8_t *FONT_BIG   = u8g2_font_9x15_tf;
 static const uint8_t *FONT_SMALL = u8g2_font_6x12_tf;
 
@@ -136,8 +151,8 @@ static const uint8_t FT6336_ADDR = 0x38;
 static const int W = 200, H = 200;
 static const int MID_X = W / 2;
 
-// Card content: pre-rendered 1bpp bitmaps from sync.html (see /cards.bin in
-// the header comment), blitted at fixed positions instead of drawn as text.
+// Card content: pre-rendered 1bpp bitmaps from sync.html (see /cards/<id>.bin
+// in the header comment), blitted at fixed positions instead of drawn as text.
 static const int BMP_W = 190, BMP_H = 36;
 static const int BMP_ROW_BYTES = (BMP_W + 7) / 8;
 static const size_t BMP_BYTES = (size_t)BMP_ROW_BYTES * BMP_H;
@@ -188,17 +203,49 @@ static Screen    screen = SCREEN_CARD;
 static CardPhase phase  = PHASE_PROMPT;
 
 // ---- Flashcards (loaded from SD) ----
-// front/back text is kept only for /state.tsv matching, never rendered; the
-// bitmaps themselves stay on SD and are read on demand by their byte offset
-// into /cards.bin so RAM use doesn't grow with deck size.
+// One file per card, /cards/<id>.bin -- see the header comment for the
+// on-disk layout. Front/back text isn't kept in RAM at all (nothing
+// on-device ever renders it), only the two lengths needed to seek past it
+// straight to the bitmaps, cached here so re-reading a card's header isn't
+// needed just to draw it or to build a LIST reply.
 struct Flashcard {
-  String front, back;
+  uint32_t id;
   int box; bool practiced;
-  uint32_t frontBmpOffset, backBmpOffset;
+  uint16_t frontLen, backLen;
 };
 static std::vector<Flashcard> cards;
 static int  currentIndex = 0;
 static bool sdOk = false;
+static uint32_t nextId = 1;   // 0 is the wire-protocol "assign me an id" sentinel
+
+// ---- Per-card file format ----
+static const char *CARDS_DIR = "/cards";
+static const char *CARD_MAGIC = "FC01";
+static const size_t CARD_MAGIC_LEN = 4;
+static const size_t CARD_HEADER_BYTES = 4 + 4 + 2 + 1;   // magic + id + box + practiced
+
+// Formats "/cards/XXXXXXXX.bin" -- 8 hex digits, zero-padded, so the
+// basename is exactly 8.3 (8 name chars + ".bin") regardless of whether the
+// FAT driver here has long-filename support.
+static void cardFilePath(uint32_t id, char *out, size_t outLen) {
+  snprintf(out, outLen, "%s/%08X.bin", CARDS_DIR, (unsigned)id);
+}
+
+// Parses the 8-hex-digit id back out of a name as returned by File::name()
+// (which may or may not include the "/cards/" prefix depending on core
+// version -- handle both by scanning from the last '/'). Returns false for
+// anything that doesn't look like one of ours, so callers can skip stray
+// junk files instead of misparsing them.
+static bool parseIdFromFilename(const char *name, uint32_t &outId) {
+  const char *slash = strrchr(name, '/');
+  const char *base = slash ? slash + 1 : name;
+  if (strlen(base) != 12 || strcmp(base + 8, ".bin") != 0) return false;
+  char *end = nullptr;
+  unsigned long v = strtoul(base, &end, 16);
+  if (end != base + 8) return false;
+  outId = (uint32_t)v;
+  return true;
+}
 
 // ---- Scheduler: session queue over `cards`, by index into that vector ----
 static const int NEW_CARDS_PER_SESSION = 12;
@@ -234,20 +281,25 @@ static volatile bool bleConnected = false;
 // would throttle every send whether or not it was necessary.
 static volatile bool notifyCongested = false;
 
-// PUT bodies (and GET responses, see sendFileOverBle() below) are streamed
-// straight to/from the SD card in BLE_CHUNK-sized pieces rather than
-// buffered whole in RAM -- a 1000-card deck is ~1.7MB, and round-tripping
-// that through a std::vector on top of everything else this device already
-// holds is exactly the kind of heap pressure that caused a crash right
-// after a large save/load completed (confirmed: SD write and BLE ack both
-// logged success, then a reboot). Streaming caps the RAM cost at one
-// BLE_CHUNK-sized buffer regardless of deck size.
+// PUT_CARD bodies (and LIST responses, see sendListOverBle() below) are
+// streamed straight to/from the SD card in BLE_CHUNK-sized pieces rather
+// than buffered whole in RAM -- buffering a whole deck through a
+// std::vector on top of everything else this device already holds is
+// exactly the kind of heap pressure that caused a crash right after a large
+// save/load completed under the old whole-blob protocol (confirmed: SD
+// write and BLE ack both logged success, then a reboot). A single card is
+// small (a couple KB) so the risk is much lower now, but streaming costs
+// nothing extra and keeps one consistent pattern.
 enum RxState { RX_IDLE, RX_BODY };
 static RxState rxState = RX_IDLE;
 static size_t rxExpected = 0;
 static size_t rxReceived = 0;
-static File putFile;         // open across the PUT's onWrite() calls
+static File putFile;         // open across a PUT_CARD's onWrite() calls
 static bool putOk = false;   // false if sdOk was false, open failed, or a write came up short
+static uint32_t putCardId = 0;
+static int      putCardBox = 0;
+static bool     putCardPracticed = false;
+static uint32_t pendingDeleteId = 0;
 
 // RxCallbacks::onWrite() runs on the NimBLE host task, inside that task's
 // own (comparatively small) stack frame for the callback. Calling back into
@@ -256,10 +308,15 @@ static bool putOk = false;   // false if sdOk was false, open failed, or a write
 // stack (confirmed here: reliably crashed right after connect, regardless
 // of chunk size or connection params, with no visible backtrace because a
 // stack overflow corrupts the very stack the panic handler would unwind).
-// So onWrite() only ever sets one of these flags; the actual send/finish
-// work happens in syncLoop() on the main Arduino task instead, which has a
-// normal-sized stack and isn't nested inside a BLE callback at all.
-enum PendingBleAction { PENDING_NONE, PENDING_SEND_CARDS, PENDING_SEND_STATE, PENDING_FINISH_PUT };
+// So onWrite() only ever sets one of these flags (or streams raw PUT_CARD
+// bytes to an already-open File, which doesn't touch the BLE stack); the
+// actual send/finish/delete work happens in syncLoop() on the main Arduino
+// task instead, which has a normal-sized stack and isn't nested inside a
+// BLE callback at all.
+enum PendingBleAction {
+  PENDING_NONE, PENDING_SEND_LIST, PENDING_FINISH_PUT_CARD,
+  PENDING_DELETE_CARD, PENDING_DELETE_ALL
+};
 static volatile PendingBleAction pendingAction = PENDING_NONE;
 
 static inline size_t minSize(size_t a, size_t b) { return a < b ? a : b; }
@@ -361,14 +418,20 @@ static void flashBox(int x, int y, int w, int h, const char *label, const uint8_
   u8f.setForegroundColor(GxEPD_BLACK);
 }
 
-// Reads one card's bitmap from /cards.bin into `bmpBuf` and blits it. No-op
-// (leaves the area blank) on any SD hiccup rather than drawing garbage.
-// Defined here, ahead of loadCards()/the SD-backed Flashcard struct below,
-// only to sit next to the screen-drawing functions that call it.
+// Reads one card's bitmap from /cards/<id>.bin into `bmpBuf` and blits it.
+// No-op (leaves the area blank) on any SD hiccup rather than drawing
+// garbage. Defined here, ahead of loadCards()/the SD-backed Flashcard struct
+// below, only to sit next to the screen-drawing functions that call it.
+// `frontLen`/`backLen` (cached on the Flashcard at load time) let this seek
+// straight to the wanted bitmap without re-reading the header.
 static uint8_t bmpBuf[BMP_BYTES];
-static void drawCardBitmap(uint32_t offset, int x, int y) {
-  File f = SD_MMC.open("/cards.bin", FILE_READ);
+static void drawCardBitmap(const Flashcard &c, bool front, int x, int y) {
+  char path[24];
+  cardFilePath(c.id, path, sizeof(path));
+  File f = SD_MMC.open(path, FILE_READ);
   if (!f) return;
+  uint32_t offset = CARD_HEADER_BYTES + 2 + c.frontLen + 2 + c.backLen;
+  if (!front) offset += BMP_BYTES;
   if (f.seek(offset) && f.read(bmpBuf, BMP_BYTES) == BMP_BYTES) {
     display.drawBitmap(x, y, bmpBuf, BMP_W, BMP_H, GxEPD_BLACK);
   }
@@ -388,7 +451,7 @@ static void drawCardPrompt() {
       printCentered(MID_X, 94, "Tap the gear, then");
       printCentered(MID_X, 110, "\"Sync mode\", to add some.");
     } else {
-      drawCardBitmap(cards[currentIndex].frontBmpOffset, FRONT_BMP_X, FRONT_BMP_Y);
+      drawCardBitmap(cards[currentIndex], true, FRONT_BMP_X, FRONT_BMP_Y);
 
       display.drawLine(0, DIV_Y, W - 1, DIV_Y, GxEPD_BLACK);
       display.drawRect(WIDE_BTN_X, BTN_Y, WIDE_BTN_W, BTN_H, GxEPD_BLACK);
@@ -406,9 +469,9 @@ static void drawCardAnswer() {
   do {
     display.fillScreen(GxEPD_WHITE);
 
-    drawCardBitmap(cards[currentIndex].frontBmpOffset, FRONT_BMP_X, FRONT_BMP_Y);
+    drawCardBitmap(cards[currentIndex], true, FRONT_BMP_X, FRONT_BMP_Y);
     drawDashedLine(DASH_Y);
-    drawCardBitmap(cards[currentIndex].backBmpOffset, BACK_BMP_X, BACK_BMP_Y);
+    drawCardBitmap(cards[currentIndex], false, BACK_BMP_X, BACK_BMP_Y);
 
     display.drawLine(0, DIV_Y, W - 1, DIV_Y, GxEPD_BLACK);
     display.drawLine(MID_X, DIV_Y, MID_X, H - 1, GxEPD_BLACK);
@@ -490,109 +553,134 @@ static void drawFatalSd() {
 }
 
 // ---- Card data ----
-// Reads a u16-LE length prefix followed by that many UTF-8 bytes into a
-// null-terminated buffer, returns false on short read (truncated/corrupt file).
-static bool readLenPrefixedString(File &f, String &out) {
+// Reads a u16-LE length prefix, then skips that many bytes without keeping
+// them -- used to walk past front/back text we don't need in RAM, while
+// still learning how long it was (cached on the Flashcard for later seeks).
+static bool readLenPrefixedSkip(File &f, uint16_t &outLen) {
   uint8_t lenBuf[2];
   if (f.read(lenBuf, 2) != 2) return false;
-  uint16_t len = lenBuf[0] | ((uint16_t)lenBuf[1] << 8);
-  std::vector<char> buf(len + 1);
-  if (len > 0 && f.read((uint8_t *)buf.data(), len) != len) return false;
-  buf[len] = '\0';
-  out = String(buf.data());
-  return true;
+  outLen = lenBuf[0] | ((uint16_t)lenBuf[1] << 8);
+  return f.seek(f.position() + outLen);
 }
 
+// Parses one already-open card file's header + record shape into `outCard`.
+// Validates the record walks exactly to EOF (catches a truncated/corrupt
+// file, same defensive spirit the old cards.bin loader had) before
+// accepting it.
+static bool loadOneCard(File &f, uint32_t idFromName, Flashcard &outCard) {
+  uint8_t hdr[CARD_HEADER_BYTES];
+  if (f.read(hdr, CARD_HEADER_BYTES) != CARD_HEADER_BYTES ||
+      memcmp(hdr, CARD_MAGIC, CARD_MAGIC_LEN) != 0) {
+    return false;
+  }
+  uint32_t idInFile = (uint32_t)hdr[4] | ((uint32_t)hdr[5] << 8) |
+                       ((uint32_t)hdr[6] << 16) | ((uint32_t)hdr[7] << 24);
+  if (idInFile != idFromName) {
+    Serial.printf("cards/%08X.bin: id mismatch (file says %08X), trusting filename\n",
+                  (unsigned)idFromName, (unsigned)idInFile);
+  }
+  outCard.id = idFromName;
+  outCard.box = hdr[8] | (hdr[9] << 8);
+  outCard.practiced = hdr[10] != 0;
+
+  if (!readLenPrefixedSkip(f, outCard.frontLen)) return false;
+  if (!readLenPrefixedSkip(f, outCard.backLen)) return false;
+  if (!f.seek(f.position() + 2 * BMP_BYTES)) return false;
+  return f.position() == f.size();
+}
+
+// Loads every card by scanning /cards/ -- "what cards exist" is just
+// "what files are in the directory," so there's no separate index/manifest
+// to fall out of sync with reality, and nothing to reconcile against a
+// second file the way the old cards.bin+state.tsv split needed.
 static bool loadCards() {
   cards.clear();
-  File f = SD_MMC.open("/cards.bin", FILE_READ);
-  if (!f) { Serial.println("no /cards.bin yet"); return false; }
+  uint32_t maxId = 0;
 
-  uint8_t hdr[8];
-  if (f.read(hdr, 8) != 8 || memcmp(hdr, "FCB1", 4) != 0) {
-    Serial.println("cards.bin: missing/bad header");
-    f.close();
-    return false;
-  }
-  uint16_t bmpW = hdr[4] | ((uint16_t)hdr[5] << 8);
-  uint16_t bmpH = hdr[6] | ((uint16_t)hdr[7] << 8);
-  if (bmpW != BMP_W || bmpH != BMP_H) {
-    Serial.printf("cards.bin: bitmap size %ux%u != expected %dx%d, ignoring\n",
-                  bmpW, bmpH, BMP_W, BMP_H);
-    f.close();
+  File dir = SD_MMC.open(CARDS_DIR);
+  if (!dir || !dir.isDirectory()) {
+    Serial.println("no /cards directory yet");
+    if (dir) dir.close();
+    nextId = 1;
     return false;
   }
 
-  while (f.available()) {
+  for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
+    if (f.isDirectory()) { f.close(); continue; }
+    uint32_t idFromName;
+    if (!parseIdFromFilename(f.name(), idFromName)) {
+      Serial.printf("cards: skipping unrecognized file %s\n", f.name());
+      f.close();
+      continue;
+    }
     Flashcard c;
-    if (!readLenPrefixedString(f, c.front)) break;
-    if (!readLenPrefixedString(f, c.back)) break;
-
-    c.frontBmpOffset = f.position();
-    c.backBmpOffset  = c.frontBmpOffset + BMP_BYTES;
-    if (!f.seek(c.backBmpOffset + BMP_BYTES)) break;   // truncated record
-
-    c.box = 0;
-    c.practiced = false;
+    bool ok = loadOneCard(f, idFromName, c);
+    f.close();
+    if (!ok) {
+      Serial.printf("cards/%08X.bin: bad/truncated record, skipping\n", (unsigned)idFromName);
+      continue;
+    }
     cards.push_back(c);
+    if (idFromName > maxId) maxId = idFromName;
   }
-  f.close();
-  Serial.printf("loaded %u card(s)\n", (unsigned)cards.size());
+  dir.close();
+
+  // openNextFile() order isn't id order; sort so "deck order" (used by
+  // buildSessionQueue()'s new-card selection below) means creation order,
+  // matching the old format's append-order behavior.
+  std::sort(cards.begin(), cards.end(),
+            [](const Flashcard &a, const Flashcard &b) { return a.id < b.id; });
+
+  nextId = maxId + 1;
+  Serial.printf("loaded %u card(s), nextId=%u\n", (unsigned)cards.size(), (unsigned)nextId);
   return !cards.empty();
 }
 
-// ---- Scheduler state (box + practiced flag per card) ----
-// Kept in its own file, separate from cards.bin, so the BLE sync page --
-// which only ever reads/writes plain front\tback rows -- can never see or
-// clobber it. Reconciled against the current `cards` by front+back match,
-// so edits/adds/removes made via sync just fall out of the match on the
-// next boot instead of corrupting anything.
-static void loadState() {
-  File f = SD_MMC.open("/state.tsv", FILE_READ);
-  if (!f) { Serial.println("no /state.tsv yet (fresh deck)"); return; }
+// Atomically rewrites one card's box/practiced; front/back text and bitmaps
+// are copied through byte-for-byte unchanged (a grade never touches them).
+// Same temp-file+rename pattern the old whole-deck saveState() used, just
+// scoped to a single small file now, so a crash mid-write can never lose
+// more than the one card being graded.
+static bool saveCard(const Flashcard &c) {
+  if (!sdOk) return false;
+  char path[24], tmpPath[28];
+  cardFilePath(c.id, path, sizeof(path));
+  snprintf(tmpPath, sizeof(tmpPath), "%s.tmp", path);
 
-  while (f.available()) {
-    String line = f.readStringUntil('\n');
-    line.replace("\r", "");
-    if (line.isEmpty()) continue;
+  File src = SD_MMC.open(path, FILE_READ);
+  if (!src) { Serial.printf("saveCard %08X: source missing\n", (unsigned)c.id); return false; }
 
-    // Parse from the right (...front\tback\tbox\tpracticed) so an
-    // embedded tab in front/back, however unlikely, can't desync the count.
-    int lastTab = line.lastIndexOf('\t');
-    if (lastTab < 0) continue;
-    int boxTab = line.lastIndexOf('\t', lastTab - 1);
-    if (boxTab < 0) continue;
-    String practicedStr = line.substring(lastTab + 1);
-    String boxStr       = line.substring(boxTab + 1, lastTab);
-    String frontBack     = line.substring(0, boxTab);
+  SD_MMC.remove(tmpPath);   // stale leftover from an interrupted save, if any
+  File dst = SD_MMC.open(tmpPath, FILE_WRITE);
+  if (!dst) { src.close(); Serial.println("saveCard: open tmp FAILED"); return false; }
 
-    int fbTab = frontBack.indexOf('\t');
-    if (fbTab < 0) continue;
-    String front = frontBack.substring(0, fbTab);      front.trim();
-    String back  = frontBack.substring(fbTab + 1);     back.trim();
+  uint8_t hdr[CARD_HEADER_BYTES];
+  memcpy(hdr, CARD_MAGIC, CARD_MAGIC_LEN);
+  hdr[4] = (uint8_t)(c.id);         hdr[5] = (uint8_t)(c.id >> 8);
+  hdr[6] = (uint8_t)(c.id >> 16);   hdr[7] = (uint8_t)(c.id >> 24);
+  hdr[8] = (uint8_t)(c.box);        hdr[9] = (uint8_t)(c.box >> 8);
+  hdr[10] = c.practiced ? 1 : 0;
+  bool ok = (dst.write(hdr, CARD_HEADER_BYTES) == CARD_HEADER_BYTES);
 
-    for (auto &c : cards) {
-      if (c.front == front && c.back == back) {
-        c.box = boxStr.toInt();
-        c.practiced = practicedStr.toInt() != 0;
-        break;
-      }
-    }
+  src.seek(CARD_HEADER_BYTES);   // skip the old header, copy everything after unchanged
+  static uint8_t copyBuf[128];
+  while (ok && src.available()) {
+    size_t n = src.read(copyBuf, sizeof(copyBuf));
+    if (n == 0) break;
+    ok = (dst.write(copyBuf, n) == n);
   }
-  f.close();
-}
 
-static void saveState() {
-  if (!sdOk) return;
-  File f = SD_MMC.open("/state.tsv", FILE_WRITE);   // "w" -> truncates
-  if (!f) { Serial.println("state save FAILED (no SD?)"); return; }
-  for (auto &c : cards) {
-    f.print(c.front); f.print('\t');
-    f.print(c.back);  f.print('\t');
-    f.print(c.box);   f.print('\t');
-    f.println(c.practiced ? 1 : 0);
+  dst.flush();
+  dst.close();
+  src.close();
+
+  if (!ok) { SD_MMC.remove(tmpPath); return false; }
+  SD_MMC.remove(path);
+  if (!SD_MMC.rename(tmpPath, path)) {
+    Serial.printf("saveCard %08X: rename FAILED\n", (unsigned)c.id);
+    return false;
   }
-  f.close();
+  return true;
 }
 
 // ---- Session queue: initial order on boot ----
@@ -647,7 +735,7 @@ static void gradeCorrect() {
   int idx = queue[queuePos];
   cards[idx].box++;
   cards[idx].practiced = true;
-  saveState();
+  saveCard(cards[idx]);
 
   queue.erase(queue.begin() + queuePos);
   // After removing the graded card, whatever slid into queuePos (if
@@ -663,7 +751,7 @@ static void gradeIncorrect() {
   int idx = queue[queuePos];
   cards[idx].box = max(0, cards[idx].box - 2);
   cards[idx].practiced = true;
-  saveState();
+  saveCard(cards[idx]);
 
   queue.erase(queue.begin() + queuePos);
   size_t nextPos = (queuePos < queue.size()) ? queuePos : 0;
@@ -701,8 +789,8 @@ static void handlePowerButton() {
   }
 }
 
-// ---- BLE protocol: GET (send /cards.bin), GET state (send /state.tsv,
-// read-only, for the sync page's stats panel), and PUT (overwrite cards) ----
+// ---- BLE protocol: LIST (send every card's id/box/practiced/text),
+// PUT_CARD (create/overwrite one card), DELETE_CARD, DELETE_ALL ----
 // Sends one payload via indicate() rather than notify(). notify() is
 // fire-and-forget at the ATT level -- the peer never confirms receipt, so a
 // silently dropped packet (which does happen; BLE has no guaranteed
@@ -732,63 +820,184 @@ static bool sendChunkReliably(const uint8_t *data, size_t n) {
   }
 }
 
-static void sendFileOverBle(const char *path, uint8_t cmd) {
-  File f;
+// LIST: streams id+box+practiced+front+back text for every loaded card,
+// same header-then-chunks shape the old whole-file sender used, but
+// assembled from many small per-card file reads instead of one path (no
+// bitmaps -- sync.html always re-renders those from text before any
+// upload, so it never needs the device's copy).
+static void sendListOverBle() {
   size_t total = 0;
-  if (sdOk) {
-    f = SD_MMC.open(path, FILE_READ);
-    if (f) total = f.size();
-  }
+  for (auto &c : cards) total += 4 + 2 + 1 + 2 + c.frontLen + 2 + c.backLen;
 
   uint8_t header[5];
-  header[0] = cmd;
+  header[0] = 0x10;
   header[1] = (uint8_t)(total & 0xFF);
   header[2] = (uint8_t)((total >> 8) & 0xFF);
   header[3] = (uint8_t)((total >> 16) & 0xFF);
   header[4] = (uint8_t)((total >> 24) & 0xFF);
-  // This header notify used to be a single unretried notify() call -- if it
-  // happened to queue right when the stack was momentarily busy (plausible
-  // right after a fresh connection), it was silently dropped, and the app
-  // would misparse the first body chunk as the header and reject the whole
-  // transfer with "unexpected reply from device". Route it through the same
-  // retry path as the body chunks below.
   if (!sendChunkReliably(header, sizeof(header))) {
-    Serial.printf("BLE: aborted send (%s), client disconnected\n", path);
-    if (f) f.close();
+    Serial.println("BLE: LIST aborted, client disconnected");
     return;
   }
 
   static uint8_t chunkBuf[BLE_CHUNK];   // reused across calls; never on the stack
+  size_t chunkLen = 0;
+  // Buffers small per-card pieces into BLE_CHUNK-sized sends instead of one
+  // send per field, same batching the old single-file sender got for free
+  // by reading BLE_CHUNK bytes at a time.
+  auto flushChunk = [&]() -> bool {
+    if (chunkLen == 0) return true;
+    bool ok = sendChunkReliably(chunkBuf, chunkLen);
+    chunkLen = 0;
+    return ok;
+  };
+  auto feed = [&](const uint8_t *data, size_t n) -> bool {
+    while (n > 0) {
+      size_t take = minSize(BLE_CHUNK - chunkLen, n);
+      memcpy(chunkBuf + chunkLen, data, take);
+      chunkLen += take; data += take; n -= take;
+      if (chunkLen == BLE_CHUNK && !flushChunk()) return false;
+    }
+    return true;
+  };
+
   size_t sent = 0;
-  while (f && sent < total) {
-    size_t n = minSize(BLE_CHUNK, total - sent);
-    if (f.read(chunkBuf, n) != n) {
-      Serial.printf("BLE: SD read short (%s) at %u/%u\n", path, (unsigned)sent, (unsigned)total);
-      break;
+  static uint8_t textBuf[128];
+  for (auto &c : cards) {
+    char path[24];
+    cardFilePath(c.id, path, sizeof(path));
+    File f = SD_MMC.open(path, FILE_READ);
+    if (!f) { Serial.printf("BLE: LIST skip %08X, open failed\n", (unsigned)c.id); continue; }
+
+    uint8_t rec[9];
+    rec[0] = (uint8_t)(c.id);       rec[1] = (uint8_t)(c.id >> 8);
+    rec[2] = (uint8_t)(c.id >> 16); rec[3] = (uint8_t)(c.id >> 24);
+    rec[4] = (uint8_t)(c.box);      rec[5] = (uint8_t)(c.box >> 8);
+    rec[6] = c.practiced ? 1 : 0;
+    rec[7] = (uint8_t)(c.frontLen); rec[8] = (uint8_t)(c.frontLen >> 8);
+    if (!feed(rec, sizeof(rec))) { f.close(); flushChunk(); return; }
+
+    f.seek(CARD_HEADER_BYTES + 2);   // front text starts right after its length prefix
+    uint16_t remaining = c.frontLen;
+    bool ok = true;
+    while (ok && remaining > 0) {
+      size_t n = minSize(sizeof(textBuf), remaining);
+      ok = (f.read(textBuf, n) == n) && feed(textBuf, n);
+      remaining -= n;
     }
-    if (!sendChunkReliably(chunkBuf, n)) {
-      Serial.printf("BLE: aborted send (%s), client disconnected\n", path);
-      f.close();
-      return;
+    if (!ok) { f.close(); flushChunk(); return; }
+
+    uint8_t backLenBytes[2] = { (uint8_t)(c.backLen), (uint8_t)(c.backLen >> 8) };
+    if (!feed(backLenBytes, sizeof(backLenBytes))) { f.close(); flushChunk(); return; }
+    f.seek(CARD_HEADER_BYTES + 2 + c.frontLen + 2);   // back text
+    remaining = c.backLen;
+    while (ok && remaining > 0) {
+      size_t n = minSize(sizeof(textBuf), remaining);
+      ok = (f.read(textBuf, n) == n) && feed(textBuf, n);
+      remaining -= n;
     }
-    sent += n;
+    f.close();
+    if (!ok) { flushChunk(); return; }
+
+    sent += 4 + 2 + 1 + 2 + c.frontLen + 2 + c.backLen;
   }
-  if (f) f.close();
-  Serial.printf("BLE: sent %u bytes (%s)\n", (unsigned)sent, path);
+  flushChunk();
+  Serial.printf("BLE: sent LIST, %u bytes / %u card(s)\n", (unsigned)sent, (unsigned)cards.size());
 }
 
-static void sendCardsOverBle() { sendFileOverBle("/cards.bin", 0x01); }
-static void sendStateOverBle() { sendFileOverBle("/state.tsv", 0x03); }
+static void upsertCardInMemory(uint32_t id, int box, bool practiced,
+                                uint16_t frontLen, uint16_t backLen) {
+  for (auto &c : cards) {
+    if (c.id == id) {
+      c.box = box; c.practiced = practiced; c.frontLen = frontLen; c.backLen = backLen;
+      return;
+    }
+  }
+  Flashcard c;
+  c.id = id; c.box = box; c.practiced = practiced;
+  c.frontLen = frontLen; c.backLen = backLen;
+  cards.push_back(c);
+}
 
-static void finishPut() {
+static void finishPutCard() {
   if (putFile) putFile.close();
-  Serial.printf("BLE: wrote /cards.bin (%u bytes) -> %s\n",
-                (unsigned)rxReceived, putOk ? "ok" : "FAILED");
 
-  uint8_t resp[2] = { 0x02, (uint8_t)(putOk ? 0x00 : 0x01) };
+  char path[24], tmpPath[28];
+  cardFilePath(putCardId, path, sizeof(path));
+  snprintf(tmpPath, sizeof(tmpPath), "%s.tmp", path);
+  if (putOk) {
+    SD_MMC.remove(path);
+    putOk = SD_MMC.rename(tmpPath, path);
+  }
+  if (!putOk) SD_MMC.remove(tmpPath);
+
+  Serial.printf("BLE: wrote card %08X (%u bytes) -> %s\n",
+                (unsigned)putCardId, (unsigned)rxReceived, putOk ? "ok" : "FAILED");
+
+  uint16_t frontLen = 0, backLen = 0;
+  if (putOk) {
+    // Peek the two lengths back out of the file we just committed, rather
+    // than threading them through from the raw PUT_CARD body bytes, so the
+    // in-RAM cache always matches what's actually on disk.
+    File f = SD_MMC.open(path, FILE_READ);
+    if (f) {
+      f.seek(CARD_HEADER_BYTES);
+      readLenPrefixedSkip(f, frontLen);
+      readLenPrefixedSkip(f, backLen);
+      f.close();
+    }
+    upsertCardInMemory(putCardId, putCardBox, putCardPracticed, frontLen, backLen);
+  }
+
+  uint8_t resp[6];
+  resp[0] = 0x11;
+  resp[1] = putOk ? 0 : 1;
+  resp[2] = (uint8_t)(putCardId);       resp[3] = (uint8_t)(putCardId >> 8);
+  resp[4] = (uint8_t)(putCardId >> 16); resp[5] = (uint8_t)(putCardId >> 24);
   sendChunkReliably(resp, sizeof(resp));
 
   rxState = RX_IDLE;
+}
+
+static void deleteCardOnDevice(uint32_t id) {
+  char path[24];
+  cardFilePath(id, path, sizeof(path));
+  bool ok = SD_MMC.remove(path);
+  if (ok) {
+    for (size_t i = 0; i < cards.size(); i++) {
+      if (cards[i].id == id) { cards.erase(cards.begin() + i); break; }
+    }
+  }
+  Serial.printf("BLE: delete card %08X -> %s\n", (unsigned)id, ok ? "ok" : "FAILED");
+  uint8_t resp[2] = { 0x12, (uint8_t)(ok ? 0 : 1) };
+  sendChunkReliably(resp, sizeof(resp));
+}
+
+static void deleteAllCardsOnDevice() {
+  uint32_t deleted = 0;
+  File dir = SD_MMC.open(CARDS_DIR);
+  if (dir && dir.isDirectory()) {
+    for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
+      bool isDirEntry = f.isDirectory();
+      uint32_t id;
+      bool named = !isDirEntry && parseIdFromFilename(f.name(), id);
+      f.close();
+      if (!named) continue;
+      char path[24];
+      cardFilePath(id, path, sizeof(path));
+      if (SD_MMC.remove(path)) deleted++;
+    }
+    dir.close();
+  }
+  cards.clear();
+  nextId = 1;
+  Serial.printf("BLE: delete all -> %u file(s) removed\n", (unsigned)deleted);
+
+  uint8_t resp[6];
+  resp[0] = 0x13; resp[1] = 0;
+  resp[2] = (uint8_t)(deleted);       resp[3] = (uint8_t)(deleted >> 8);
+  resp[4] = (uint8_t)(deleted >> 16); resp[5] = (uint8_t)(deleted >> 24);
+  sendChunkReliably(resp, sizeof(resp));
 }
 
 // indicate() (unlike notify()) blocks until the peer's ATT-level
@@ -810,29 +1019,53 @@ class RxCallbacks : public BLECharacteristicCallbacks {
     if (len == 0) return;
 
     if (rxState == RX_IDLE) {
-      if (data[0] == 0x01) {                       // GET
-        pendingAction = PENDING_SEND_CARDS;         // actual send: syncLoop()
-      } else if (data[0] == 0x03) {                 // GET state (stats)
-        pendingAction = PENDING_SEND_STATE;         // actual send: syncLoop()
-      } else if (data[0] == 0x02 && len >= 5) {     // PUT header
-        uint32_t total = (uint32_t)data[1] | ((uint32_t)data[2] << 8) |
+      if (data[0] == 0x10) {                        // LIST
+        pendingAction = PENDING_SEND_LIST;          // actual send: syncLoop()
+      } else if (data[0] == 0x11 && len >= 12) {    // PUT_CARD header
+        uint32_t reqId = (uint32_t)data[1] | ((uint32_t)data[2] << 8) |
                           ((uint32_t)data[3] << 16) | ((uint32_t)data[4] << 24);
-        rxExpected = total;
+        putCardBox = data[5] | (data[6] << 8);
+        putCardPracticed = data[7] != 0;
+        uint32_t bodyLen = (uint32_t)data[8] | ((uint32_t)data[9] << 8) |
+                            ((uint32_t)data[10] << 16) | ((uint32_t)data[11] << 24);
+        putCardId = (reqId == 0) ? nextId++ : reqId;
+        rxExpected = bodyLen;
         rxReceived = 0;
         putOk = sdOk;
         if (putOk) {
-          putFile = SD_MMC.open("/cards.bin", FILE_WRITE);   // "w" -> truncates
-          if (!putFile) putOk = false;
+          char path[24], tmpPath[28];
+          cardFilePath(putCardId, path, sizeof(path));
+          snprintf(tmpPath, sizeof(tmpPath), "%s.tmp", path);
+          SD_MMC.remove(tmpPath);
+          putFile = SD_MMC.open(tmpPath, FILE_WRITE);
+          if (!putFile) {
+            putOk = false;
+          } else {
+            uint8_t hdr[CARD_HEADER_BYTES];
+            memcpy(hdr, CARD_MAGIC, CARD_MAGIC_LEN);
+            hdr[4] = (uint8_t)(putCardId);       hdr[5] = (uint8_t)(putCardId >> 8);
+            hdr[6] = (uint8_t)(putCardId >> 16); hdr[7] = (uint8_t)(putCardId >> 24);
+            hdr[8] = (uint8_t)(putCardBox);      hdr[9] = (uint8_t)(putCardBox >> 8);
+            hdr[10] = putCardPracticed ? 1 : 0;
+            putOk = (putFile.write(hdr, CARD_HEADER_BYTES) == CARD_HEADER_BYTES);
+          }
         }
-        if (total == 0) pendingAction = PENDING_FINISH_PUT;   // actual finish: syncLoop()
+        if (bodyLen == 0) pendingAction = PENDING_FINISH_PUT_CARD;   // actual finish: syncLoop()
         else rxState = RX_BODY;
+      } else if (data[0] == 0x12 && len >= 5) {     // DELETE_CARD
+        pendingDeleteId = (uint32_t)data[1] | ((uint32_t)data[2] << 8) |
+                           ((uint32_t)data[3] << 16) | ((uint32_t)data[4] << 24);
+        pendingAction = PENDING_DELETE_CARD;        // actual delete: syncLoop()
+      } else if (data[0] == 0x13) {                 // DELETE_ALL
+        pendingAction = PENDING_DELETE_ALL;         // actual delete: syncLoop()
       }
     } else {   // RX_BODY: raw body bytes, no framing -- streamed straight to
-               // SD as they arrive rather than buffered in RAM, see putFile.
+               // the temp file as they arrive rather than buffered in RAM,
+               // see putFile.
       size_t n = minSize(len, rxExpected - rxReceived);
       if (putOk && n > 0 && putFile.write(data, n) != n) putOk = false;
       rxReceived += n;
-      if (rxReceived >= rxExpected) pendingAction = PENDING_FINISH_PUT;   // actual finish: syncLoop()
+      if (rxReceived >= rxExpected) pendingAction = PENDING_FINISH_PUT_CARD;   // actual finish: syncLoop()
     }
   }
 };
@@ -878,9 +1111,10 @@ static void syncLoop() {
     PendingBleAction action = pendingAction;
     pendingAction = PENDING_NONE;
     switch (action) {
-      case PENDING_SEND_CARDS: sendCardsOverBle(); break;
-      case PENDING_SEND_STATE: sendStateOverBle(); break;
-      case PENDING_FINISH_PUT: finishPut(); break;
+      case PENDING_SEND_LIST:       sendListOverBle(); break;
+      case PENDING_FINISH_PUT_CARD: finishPutCard(); break;
+      case PENDING_DELETE_CARD:     deleteCardOnDevice(pendingDeleteId); break;
+      case PENDING_DELETE_ALL:      deleteAllCardsOnDevice(); break;
       case PENDING_NONE: break;
     }
 
@@ -994,14 +1228,16 @@ void setup() {
     while (true) { handlePowerButton(); delay(50); }
   }
 
+  // FILE_WRITE never creates missing parent directories, so a fresh/wiped
+  // SD card with no /cards/ yet would make the very first PUT_CARD fail to
+  // open its temp file and report a save error -- make sure it exists
+  // before anything tries to write into it.
+  if (!SD_MMC.exists(CARDS_DIR)) SD_MMC.mkdir(CARDS_DIR);
+
   loadCards();
-  loadState();
 
   randomSeed(esp_random());
   buildSessionQueue();
-  saveState();   // so /state.tsv (and the sync page's stats) are fresh even
-                  // before the first grade of the session, e.g. right after
-                  // a deck edit adds cards that were never graded before
   screen = SCREEN_CARD;
   phase  = PHASE_PROMPT;
   drawCardPrompt();

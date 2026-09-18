@@ -62,3 +62,16 @@ arduino-cli upload  --fqbn esp32:esp32:esp32s3 --port /dev/ttyACM0 code/scripts/
 
 Libraries: `GxEPD2`, `U8g2_for_Adafruit_GFX`, and the ESP32 core (`WiFi`,
 `WebServer`, `SD_MMC`; needs core ≥ 2.0.7 for `SD_MMC.setPins()`).
+
+---
+
+## Internal: `code/scripts/007_esp_s3_touch_flashcard_ble` — build / flash
+
+```
+arduino-cli compile --fqbn "esp32:esp32:esp32s3:PSRAM=opi,PartitionScheme=default_8MB,FlashSize=8M" code/scripts/007_esp_s3_touch_flashcard_ble
+arduino-cli upload  --fqbn "esp32:esp32:esp32s3:PSRAM=opi,PartitionScheme=default_8MB,FlashSize=8M" --port /dev/ttyACM0 code/scripts/007_esp_s3_touch_flashcard_ble
+```
+
+Board options must be set explicitly (OPI PSRAM, 8MB flash, 8MB-with-spiffs
+partition scheme) — the generic `esp32:esp32:esp32s3` FQBN's defaults are
+4MB flash / no PSRAM and will boot-loop on this board otherwise.
