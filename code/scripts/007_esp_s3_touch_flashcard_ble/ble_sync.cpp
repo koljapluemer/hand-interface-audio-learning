@@ -4,6 +4,7 @@
 #include <BLEUtils.h>
 #include <BLE2902.h>
 #include <cstring>
+#include "esp_rom_crc.h"
 #include "SD_MMC.h"
 #include "config.h"
 #include "card_store.h"
@@ -38,6 +39,21 @@ static int      putCardBox = 0;
 static bool     putCardPracticed = false;
 static uint32_t pendingDeleteId = 0;
 
+#if BLE_FAST_SYNC
+static constexpr uint8_t FAST_BEGIN  = 0x20;
+static constexpr uint8_t FAST_DATA   = 0x21;
+static constexpr uint8_t FAST_STATUS = 0x22;
+static constexpr uint8_t FAST_COMMIT = 0x23;
+static constexpr uint8_t FAST_WINDOW = 4;
+static bool fastActive = false;
+static uint32_t fastTransferId = 0;
+static uint32_t fastRequestedCardId = 0;
+static uint32_t fastExpectedCrc = 0;
+static uint8_t fastFramesSinceAck = 0;
+static uint8_t fastReplyOpcode = 0;
+static uint8_t fastReplyStatus = 0;
+#endif
+
 #if BLE_TIMING_DEBUG
 struct PutTiming {
   uint32_t headerAt;
@@ -62,7 +78,10 @@ static PutTiming putTiming = {};
 // send/finish/delete work happens in bleSyncTick() on the main Arduino task.
 enum PendingBleAction {
   PENDING_NONE, PENDING_SEND_LIST, PENDING_FINISH_PUT_CARD,
-  PENDING_DELETE_CARD, PENDING_DELETE_ALL
+  PENDING_DELETE_CARD, PENDING_DELETE_ALL,
+#if BLE_FAST_SYNC
+  PENDING_FAST_REPLY, PENDING_FAST_COMMIT
+#endif
 };
 static volatile PendingBleAction pendingAction = PENDING_NONE;
 
@@ -93,6 +112,89 @@ static void putU32(uint8_t *out, uint32_t v) {
   out[0] = (uint8_t)v;         out[1] = (uint8_t)(v >> 8);
   out[2] = (uint8_t)(v >> 16); out[3] = (uint8_t)(v >> 24);
 }
+
+static uint32_t getU32(const uint8_t *in) {
+  return (uint32_t)in[0] | ((uint32_t)in[1] << 8) |
+         ((uint32_t)in[2] << 16) | ((uint32_t)in[3] << 24);
+}
+
+#if BLE_FAST_SYNC
+static void queueFastReply(uint8_t opcode, uint8_t status) {
+  fastReplyOpcode = opcode;
+  fastReplyStatus = status;
+  pendingAction = PENDING_FAST_REPLY;
+}
+
+static void sendFastReply() {
+  uint8_t resp[14];
+  resp[0] = fastReplyOpcode;
+  resp[1] = fastReplyStatus;
+  putU32(resp + 2, fastTransferId);
+  putU32(resp + 6, (uint32_t)rxReceived);
+  size_t len = 10;
+  if (fastReplyOpcode == FAST_COMMIT) {
+    putU32(resp + 10, putCardId);
+    len = 14;
+  }
+  sendChunkReliably(resp, len);
+}
+
+static bool validCardBodyShape() {
+  if (putBody.size() < 4 + 2 * BMP_BYTES) return false;
+  size_t frontLen = putBody[0] | ((size_t)putBody[1] << 8);
+  size_t backLenOffset = 2 + frontLen;
+  if (backLenOffset + 2 > putBody.size()) return false;
+  size_t backLen = putBody[backLenOffset] | ((size_t)putBody[backLenOffset + 1] << 8);
+  return backLenOffset + 2 + backLen + 2 * BMP_BYTES == putBody.size();
+}
+
+static void commitFastCard() {
+  uint8_t status = 0;
+  if (!fastActive || rxReceived != rxExpected || !putOk || !validCardBodyShape()) {
+    status = 1;
+  } else if (esp_rom_crc32_le(0, putBody.data(), putBody.size()) != fastExpectedCrc) {
+    status = 2;
+  }
+
+  putCardId = fastRequestedCardId ? fastRequestedCardId : nextId;
+  char path[24], tmpPath[28];
+  cardFilePath(putCardId, path, sizeof(path));
+  cardTmpPath(putCardId, tmpPath, sizeof(tmpPath));
+  if (status == 0) {
+    SD_MMC.remove(tmpPath);
+    File f = SD_MMC.open(tmpPath, FILE_WRITE);
+    if (!f) status = 3;
+    else {
+      uint8_t hdr[CARD_HEADER_BYTES];
+      encodeCardHeader(hdr, putCardId, putCardBox, putCardPracticed);
+      bool written = f.write(hdr, CARD_HEADER_BYTES) == CARD_HEADER_BYTES &&
+                     f.write(putBody.data(), putBody.size()) == putBody.size();
+      f.close();
+      if (!written) status = 3;
+    }
+  }
+  if (status == 0) {
+    SD_MMC.remove(path);
+    if (!SD_MMC.rename(tmpPath, path)) status = 3;
+  }
+  if (status != 0) SD_MMC.remove(tmpPath);
+
+  if (status == 0) {
+    if (!fastRequestedCardId) nextId++;
+    uint16_t frontLen = 0, backLen = 0;
+    readCardTextLens(putCardId, frontLen, backLen);
+    upsertCardInMemory(putCardId, putCardBox, putCardPracticed, frontLen, backLen);
+  }
+  Serial.printf("BLE fast: commit card %08X (%u bytes, crc=%08X) -> %s\n",
+                (unsigned)putCardId, (unsigned)rxReceived, (unsigned)fastExpectedCrc,
+                status == 0 ? "ok" : "FAILED");
+  fastReplyOpcode = FAST_COMMIT;
+  fastReplyStatus = status;
+  sendFastReply();
+  fastActive = false;
+  putBody.clear();
+}
+#endif
 
 // LIST: streams id+box+practiced+front+back text for every loaded card,
 // batched into BLE_CHUNK-sized sends.
@@ -288,7 +390,55 @@ class RxCallbacks : public BLECharacteristicCallbacks {
     if (rxState == RX_IDLE) {
       if (data[0] == 0x10) {                        // LIST
         pendingAction = PENDING_SEND_LIST;
+#if BLE_FAST_SYNC
+      } else if (data[0] == FAST_BEGIN && len >= 20) {
+        fastTransferId = getU32(data + 1);
+        fastRequestedCardId = getU32(data + 5);
+        putCardBox = data[9] | (data[10] << 8);
+        putCardPracticed = data[11] != 0;
+        rxExpected = getU32(data + 12);
+        fastExpectedCrc = getU32(data + 16);
+        rxReceived = 0;
+        fastFramesSinceAck = 0;
+        putOk = sdOk && fastTransferId != 0 && rxExpected <= MAX_CARD_BODY_BYTES;
+        putBody.clear();
+        if (putOk) putBody.resize(rxExpected);
+        fastActive = putOk;
+        queueFastReply(FAST_BEGIN, putOk ? 0 : 1);
+      } else if (data[0] == FAST_DATA && len >= 9) {
+        uint32_t transferId = getU32(data + 1);
+        uint32_t offset = getU32(data + 5);
+        size_t payloadLen = len - 9;
+        if (!fastActive || transferId != fastTransferId) {
+          queueFastReply(FAST_DATA, 1);
+        } else if (offset == rxReceived && payloadLen <= rxExpected - rxReceived) {
+          memcpy(putBody.data() + rxReceived, data + 9, payloadLen);
+          rxReceived += payloadLen;
+          fastFramesSinceAck++;
+          if (fastFramesSinceAck >= FAST_WINDOW || rxReceived == rxExpected) {
+            fastFramesSinceAck = 0;
+            queueFastReply(FAST_DATA, 0);
+          }
+        } else if (offset < rxReceived && offset + payloadLen <= rxReceived) {
+          // Harmless duplicate after a lost cumulative ACK.
+          queueFastReply(FAST_DATA, 0);
+        } else {
+          // Gap, overlap, or out-of-bounds frame: report the contiguous offset.
+          queueFastReply(FAST_DATA, 2);
+        }
+      } else if (data[0] == FAST_STATUS && len >= 5) {
+        uint32_t transferId = getU32(data + 1);
+        queueFastReply(FAST_STATUS,
+                       fastActive && transferId == fastTransferId ? 0 : 1);
+      } else if (data[0] == FAST_COMMIT && len >= 5) {
+        uint32_t transferId = getU32(data + 1);
+        if (fastActive && transferId == fastTransferId) pendingAction = PENDING_FAST_COMMIT;
+        else queueFastReply(FAST_COMMIT, 1);
+#endif
       } else if (data[0] == 0x11 && len >= 12) {    // PUT_CARD header
+#if BLE_FAST_SYNC
+        fastActive = false;                         // explicit legacy fallback
+#endif
         uint32_t reqId = (uint32_t)data[1] | ((uint32_t)data[2] << 8) |
                           ((uint32_t)data[3] << 16) | ((uint32_t)data[4] << 24);
         putCardBox = data[5] | (data[6] << 8);
@@ -345,24 +495,34 @@ class ServerCallbacks : public BLEServerCallbacks {
     bleConnected = true;
     rxState = RX_IDLE;
     putBody.clear();                 // discard a prior connection's partial PUT
+#if BLE_FAST_SYNC
+    fastActive = false;
+#endif
     Serial.println("BLE: central connected");
   }
   void onConnect(BLEServer *pServer, ble_gap_conn_desc *desc) override {
     bleConnHandle = desc->conn_handle;
     connParamRequestPending = true;
+#if BLE_TIMING_DEBUG
     Serial.printf("BLE_CONN initial interval=%.2fms latency=%u timeout=%ums handle=%u\n",
                   desc->conn_itvl * 1.25, (unsigned)desc->conn_latency,
                   (unsigned)desc->supervision_timeout * 10, (unsigned)desc->conn_handle);
+#endif
   }
   void onConnParamsUpdate(uint16_t conn_handle, uint16_t interval,
                           uint16_t latency, uint16_t timeout, uint8_t status) override {
+#if BLE_TIMING_DEBUG
     Serial.printf("BLE_CONN updated status=%u interval=%.2fms latency=%u timeout=%ums handle=%u\n",
                   (unsigned)status, interval * 1.25, (unsigned)latency,
                   (unsigned)timeout * 10, (unsigned)conn_handle);
+#endif
   }
   void onDisconnect(BLEServer *pServer) override {
     bleConnected = false;
     connParamRequestPending = false;
+#if BLE_FAST_SYNC
+    fastActive = false;
+#endif
     Serial.println("BLE: central disconnected, re-advertising");
     pServer->startAdvertising();
   }
@@ -388,7 +548,8 @@ void bleSyncStart() {
   // Plain acknowledged WRITE: write-without-response was faster but silently
   // dropped data mid-upload (a save "completed" client-side, the device never
   // got the full body). Reliability matters more than the extra speed.
-  BLECharacteristic *rxChar = service->createCharacteristic(NUS_RX_UUID, BLECharacteristic::PROPERTY_WRITE);
+  BLECharacteristic *rxChar = service->createCharacteristic(
+    NUS_RX_UUID, BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
   rxChar->setCallbacks(new RxCallbacks());
 
   service->start();
@@ -405,7 +566,11 @@ void bleSyncTick() {
   if (connParamRequestPending) {
     connParamRequestPending = false;
     bool queued = pServer->requestConnParams(bleConnHandle, 12, 24, 0, 400);
+#if BLE_TIMING_DEBUG
     Serial.printf("BLE_CONN request 15-30ms latency=0 -> %s\n", queued ? "queued" : "FAILED");
+#else
+    (void)queued;
+#endif
   }
 
   // Snapshot-and-clear before dispatching in case the action itself takes a
@@ -417,6 +582,10 @@ void bleSyncTick() {
     case PENDING_FINISH_PUT_CARD: finishPutCard(); break;
     case PENDING_DELETE_CARD:     deleteCardOnDevice(pendingDeleteId); break;
     case PENDING_DELETE_ALL:      deleteAllCardsOnDevice(); break;
+#if BLE_FAST_SYNC
+    case PENDING_FAST_REPLY:      sendFastReply(); break;
+    case PENDING_FAST_COMMIT:     commitFastCard(); break;
+#endif
     case PENDING_NONE: break;
   }
 }

@@ -105,3 +105,7 @@ constexpr size_t BLE_CHUNK = 180;
 // serial summary are omitted entirely. Keep per-chunk logging out of callbacks:
 // it would change the timing we are trying to measure.
 #define BLE_TIMING_DEBUG 1
+
+// Versioned fast PUT protocol. This is a production feature, not diagnostic
+// code; set to 0 only to build firmware that exposes the legacy protocol.
+#define BLE_FAST_SYNC 1

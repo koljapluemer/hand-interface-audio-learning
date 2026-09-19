@@ -26,6 +26,20 @@
 //
 //   DELETE_CARD (app -> device): one write [0x12, id:u32 LE]; reply [0x12, status].
 //   DELETE_ALL  (app -> device): single byte 0x13; reply [0x13, status, deleted:u32 LE].
+//
+// Versioned fast PUT (when BLE_FAST_SYNC is enabled):
+//   BEGIN 0x20 (acknowledged write): transferId, requested card id, metadata,
+//     total body length and CRC32. Device replies with status + next offset.
+//   DATA 0x21 (write without response): transferId, absolute byte offset and
+//     payload. Four-frame bounded windows receive a cumulative next-offset
+//     notification; duplicates are idempotent and gaps report the last
+//     contiguous offset.
+//   STATUS 0x22 (acknowledged write): recovers progress after a lost window
+//     acknowledgment.
+//   COMMIT 0x23 (acknowledged write): verifies exact length, record shape and
+//     whole-body CRC before the existing atomic temp-file rename. The response
+//     contains the committed card id. sync.html falls back to PUT_CARD if a
+//     connected device does not answer BEGIN.
 #pragma once
 
 void bleSyncStart();   // init BLE, advertise; never torn down (leave via restart)

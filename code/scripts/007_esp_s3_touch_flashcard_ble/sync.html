@@ -105,6 +105,11 @@ const RX_UUID      = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';   // app -> device
 const TX_UUID      = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';   // device -> app
 const CHUNK = 180;   // must match BLE_CHUNK on the device (244 crashed the device -- see .ino)
 const BLE_TIMING_DEBUG = true;  // one aggregate console summary per operation
+const BLE_FAST_SYNC = true;
+const FAST_BEGIN = 0x20, FAST_DATA = 0x21, FAST_STATUS = 0x22, FAST_COMMIT = 0x23;
+const FAST_FRAME_BYTES = 180, FAST_FRAME_HEADER_BYTES = 9;
+const FAST_PAYLOAD_BYTES = FAST_FRAME_BYTES - FAST_FRAME_HEADER_BYTES;
+const FAST_WINDOW = 4;
 
 // ---- Card bitmap format (must match BMP_W/BMP_H and the /cards/<id>.bin
 // layout in 007_esp_s3_touch_flashcard_ble.ino) ----
@@ -356,6 +361,22 @@ async function writeRaw(bytes) {
   }
 }
 
+// Write Command: fast because there is no ATT response per frame. Reliability
+// is supplied by offsets, bounded windows, cumulative ACKs, STATUS recovery,
+// and a whole-card CRC in the application protocol below.
+async function writeRawFast(bytes) {
+  if (!rxChar.writeValueWithoutResponse) throw new Error('write without response is unavailable');
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await rxChar.writeValueWithoutResponse(bytes);
+      return;
+    } catch (err) {
+      if (attempt >= 12 || !/GATT operation already in progress/i.test(err.message)) throw err;
+      await new Promise((r) => setTimeout(r, 4 * (attempt + 1)));
+    }
+  }
+}
+
 async function writeChunked(bytes, onProgress, timing) {
   for (let i = 0; i < bytes.length; i += CHUNK) {
     const started = BLE_TIMING_DEBUG ? performance.now() : 0;
@@ -370,7 +391,17 @@ function toBytes(dataView) {
 }
 
 function readU32LE(b, off) {
-  return b[off] | (b[off + 1] << 8) | (b[off + 2] << 16) | (b[off + 3] << 24);
+  return (b[off] | (b[off + 1] << 8) | (b[off + 2] << 16) | (b[off + 3] << 24)) >>> 0;
+}
+
+// CRC-32/ISO-HDLC, matching esp_rom_crc32_le(0, ...) on the ESP32.
+function crc32(bytes) {
+  let crc = 0xffffffff;
+  for (const byte of bytes) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit++) crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
+  }
+  return (~crc) >>> 0;
 }
 
 // No response ever arrives if the device drops off mid-transfer (crash,
@@ -379,6 +410,121 @@ function readU32LE(b, off) {
 // So this also races a stall timer (reset on every chunk) and an explicit
 // disconnect listener, and always cleans both up via cleanup().
 const STALL_TIMEOUT_MS = 8000;
+
+class FastReplyTimeout extends Error {}
+
+// Installs the listener before sending, and does not resolve until both the
+// browser has submitted the complete window and the matching cumulative reply
+// has arrived. A notification may arrive before the final JS await resumes.
+function fastExchange(opcode, transferId, send, timeoutMs = 3000) {
+  const dev = device, tx = txChar;
+  return new Promise((resolve, reject) => {
+    let timer, reply = null, sendDone = false, settled = false;
+    function cleanup() {
+      clearTimeout(timer);
+      tx.removeEventListener('characteristicvaluechanged', onNotify);
+      dev.removeEventListener('gattserverdisconnected', onDisconnect);
+    }
+    function finishIfReady() {
+      if (!settled && sendDone && reply) {
+        settled = true; cleanup(); resolve(reply);
+      }
+    }
+    function fail(err) {
+      if (settled) return;
+      settled = true; cleanup(); reject(err);
+    }
+    function onDisconnect() { fail(new Error('device disconnected during fast transfer')); }
+    function onNotify(e) {
+      const bytes = toBytes(e.target.value);
+      if (bytes.length >= 10 && bytes[0] === opcode && readU32LE(bytes, 2) === transferId) {
+        reply = bytes.slice();
+        finishIfReady();
+      }
+    }
+    tx.addEventListener('characteristicvaluechanged', onNotify);
+    dev.addEventListener('gattserverdisconnected', onDisconnect);
+    timer = setTimeout(() => fail(new FastReplyTimeout(`fast opcode 0x${opcode.toString(16)} timed out`)), timeoutMs);
+    (async () => {
+      try {
+        await send();
+        sendDone = true;
+        finishIfReady();
+      } catch (err) { fail(err); }
+    })();
+  });
+}
+
+function randomTransferId() {
+  const value = new Uint32Array(1);
+  do crypto.getRandomValues(value); while (value[0] === 0);
+  return value[0];
+}
+
+async function fastControl(opcode, transferId, extra = new Uint8Array()) {
+  return fastExchange(opcode, transferId, () =>
+    writeRaw(concatBytes(new Uint8Array([opcode]), u32le(transferId), extra)));
+}
+
+async function fastPutCard(card, body, onProgress) {
+  const transferId = randomTransferId();
+  const started = BLE_TIMING_DEBUG ? performance.now() : 0;
+  const begin = concatBytes(
+    new Uint8Array([FAST_BEGIN]), u32le(transferId), u32le(card.id || 0),
+    u16le(card.box || 0), new Uint8Array([card.practiced ? 1 : 0]),
+    u32le(body.length), u32le(crc32(body)),
+  );
+
+  let reply;
+  try {
+    reply = await fastExchange(FAST_BEGIN, transferId, () => writeRaw(begin));
+  } catch (err) {
+    if (err instanceof FastReplyTimeout) err.fastProtocolUnavailable = true;
+    throw err;
+  }
+  if (reply[1] !== 0) throw new Error(`device rejected fast transfer (${reply[1]})`);
+
+  let offset = readU32LE(reply, 6), stalls = 0, windows = 0;
+  while (offset < body.length) {
+    const windowStart = offset;
+    let windowEnd = offset;
+    const frames = [];
+    for (let count = 0; count < FAST_WINDOW && windowEnd < body.length; count++) {
+      const end = Math.min(windowEnd + FAST_PAYLOAD_BYTES, body.length);
+      frames.push(concatBytes(
+        new Uint8Array([FAST_DATA]), u32le(transferId), u32le(windowEnd), body.slice(windowEnd, end),
+      ));
+      windowEnd = end;
+    }
+
+    try {
+      reply = await fastExchange(FAST_DATA, transferId, async () => {
+        for (const frame of frames) await writeRawFast(frame);
+      }, 4000);
+    } catch (err) {
+      if (!(err instanceof FastReplyTimeout)) throw err;
+      reply = await fastControl(FAST_STATUS, transferId);
+    }
+    if (reply[1] !== 0 && reply[1] !== 2) throw new Error(`fast data rejected (${reply[1]})`);
+    const acknowledged = readU32LE(reply, 6);
+    if (acknowledged > body.length) throw new Error('device reported an invalid transfer offset');
+    if (acknowledged <= windowStart) {
+      if (++stalls > 4) throw new Error('fast transfer made no progress');
+    } else {
+      stalls = 0;
+      offset = acknowledged;
+      if (onProgress) onProgress(offset, body.length);
+    }
+    windows++;
+  }
+
+  reply = await fastControl(FAST_COMMIT, transferId);
+  if (reply[1] !== 0 || reply.length < 14) throw new Error(`device failed fast commit (${reply[1]})`);
+  if (BLE_TIMING_DEBUG) console.info('BLE_FAST_TIMING', {
+    bytes: body.length, windows, totalMs: +(performance.now() - started).toFixed(1),
+  });
+  return readU32LE(reply, 10);
+}
 
 function getChunkedReply(cmdByte, onProgress) {
   // Capture these locally: onDisconnected() (the page-wide handler) nulls
@@ -553,16 +699,21 @@ async function putCard(card, onProgress) {
     u16le(backText.length), backText,
     frontBmp, backBmp,
   );
+  if (BLE_FAST_SYNC) {
+    try {
+      return await fastPutCard(card, body, onProgress);
+    } catch (err) {
+      if (!err.fastProtocolUnavailable) throw err;
+      console.warn('Fast sync unavailable; falling back to acknowledged writes.');
+    }
+  }
   const header = concatBytes(
-    new Uint8Array([0x11]),
-    u32le(card.id || 0),
-    u16le(card.box || 0),
-    new Uint8Array([card.practiced ? 1 : 0]),
-    u32le(body.length),
+    new Uint8Array([0x11]), u32le(card.id || 0), u16le(card.box || 0),
+    new Uint8Array([card.practiced ? 1 : 0]), u32le(body.length),
   );
   const ack = await putWithAck(0x11, header, body, onProgress);
   if (ack[1] !== 0) throw new Error('device reported a save error for this card');
-  return readU32LE(ack, 2);   // assigned/confirmed id
+  return readU32LE(ack, 2);
 }
 
 async function deleteCard(id) {
