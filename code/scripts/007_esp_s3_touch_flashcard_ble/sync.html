@@ -104,6 +104,7 @@ const SERVICE_UUID = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
 const RX_UUID      = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';   // app -> device
 const TX_UUID      = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';   // device -> app
 const CHUNK = 180;   // must match BLE_CHUNK on the device (244 crashed the device -- see .ino)
+const BLE_TIMING_DEBUG = true;  // one aggregate console summary per operation
 
 // ---- Card bitmap format (must match BMP_W/BMP_H and the /cards/<id>.bin
 // layout in 007_esp_s3_touch_flashcard_ble.ino) ----
@@ -355,9 +356,11 @@ async function writeRaw(bytes) {
   }
 }
 
-async function writeChunked(bytes, onProgress) {
+async function writeChunked(bytes, onProgress, timing) {
   for (let i = 0; i < bytes.length; i += CHUNK) {
+    const started = BLE_TIMING_DEBUG ? performance.now() : 0;
     await writeRaw(bytes.slice(i, i + CHUNK));
+    if (timing) timing.chunkMs.push(performance.now() - started);
     if (onProgress) onProgress(Math.min(i + CHUNK, bytes.length), bytes.length);
   }
 }
@@ -479,6 +482,9 @@ function putWithAck(cmdByte, headerBytes, bodyBytes, onProgress) {
   // must not read the mutable `device`/`txChar` globals (onDisconnected()
   // nulls them out before this function's own onDisconnect below runs).
   const dev = device, tx = txChar;
+  const timing = BLE_TIMING_DEBUG ? {
+    started: performance.now(), headerMs: 0, chunkMs: [], writesDoneAt: 0,
+  } : null;
   return new Promise((resolve, reject) => {
     let ackTimer = null;
     function cleanup() {
@@ -493,6 +499,22 @@ function putWithAck(cmdByte, headerBytes, bodyBytes, onProgress) {
     const onNotify = (e) => {
       const bytes = toBytes(e.target.value);
       if (bytes.length >= 2 && bytes[0] === cmdByte) {
+        if (timing) {
+          const totalMs = performance.now() - timing.started;
+          const chunkTotalMs = timing.chunkMs.reduce((sum, ms) => sum + ms, 0);
+          const chunkMaxMs = timing.chunkMs.length ? Math.max(...timing.chunkMs) : 0;
+          console.info('BLE_TIMING', {
+            command: `0x${cmdByte.toString(16)}`,
+            bytes: bodyBytes ? bodyBytes.length : 0,
+            chunks: timing.chunkMs.length,
+            headerMs: +timing.headerMs.toFixed(1),
+            chunkTotalMs: +chunkTotalMs.toFixed(1),
+            chunkAverageMs: +(timing.chunkMs.length ? chunkTotalMs / timing.chunkMs.length : 0).toFixed(1),
+            chunkMaxMs: +chunkMaxMs.toFixed(1),
+            commitAndAckMs: +(timing.writesDoneAt ? performance.now() - timing.writesDoneAt : 0).toFixed(1),
+            totalMs: +totalMs.toFixed(1),
+          });
+        }
         cleanup();
         resolve(bytes);
       }
@@ -501,8 +523,11 @@ function putWithAck(cmdByte, headerBytes, bodyBytes, onProgress) {
     dev.addEventListener('gattserverdisconnected', onDisconnect);
     (async () => {
       try {
+        const headerAt = BLE_TIMING_DEBUG ? performance.now() : 0;
         await writeRaw(headerBytes);
-        if (bodyBytes && bodyBytes.length) await writeChunked(bodyBytes, onProgress);
+        if (timing) timing.headerMs = performance.now() - headerAt;
+        if (bodyBytes && bodyBytes.length) await writeChunked(bodyBytes, onProgress, timing);
+        if (timing) timing.writesDoneAt = performance.now();
         // All bytes are on the wire; only the device's SD write/delete + ack
         // notify are left, which should be near-instant. Don't hang forever
         // if that notify gets dropped or the device wedges right at the end.

@@ -12,24 +12,45 @@
 static BLEServer *pServer = nullptr;
 static BLECharacteristic *pTxCharacteristic = nullptr;
 static volatile bool bleConnected = false;
+static volatile bool connParamRequestPending = false;
+static uint16_t bleConnHandle = 0;
 // Set by TxCallbacks::onStatus() whenever an indicate() fails to queue (stack
 // congested) or times out waiting for the peer's confirmation --
 // sendChunkReliably() polls it to back off and retry only when needed.
 static volatile bool notifyCongested = false;
 
-// PUT_CARD bodies (and LIST responses) are streamed to/from the SD card in
-// BLE_CHUNK-sized pieces rather than buffered whole in RAM -- heap pressure
-// from whole-deck buffering once caused a reboot right after a large save.
+// Buffer one PUT_CARD body in RAM, then write it to SD in one operation after
+// all BLE chunks have arrived. Writing every 180-byte chunk synchronously from
+// onWrite() delays that chunk's ATT response until the SD write completes and
+// can make an otherwise tiny card transfer take tens of seconds. This remains
+// bounded to one card (unlike the old whole-deck buffer that exhausted RAM).
 enum RxState { RX_IDLE, RX_BODY };
 static RxState rxState = RX_IDLE;
 static size_t rxExpected = 0;
 static size_t rxReceived = 0;
-static File putFile;         // open across a PUT_CARD's onWrite() calls
-static bool putOk = false;   // false if sdOk was false, open failed, or a write came up short
+static std::vector<uint8_t> putBody;
+static bool putOk = false;   // false if allocation, SD open, or write fails
+// Body layout has two u16-sized text fields plus their prefixes and bitmaps.
+// Reject anything larger before resizing the one-card buffer.
+static constexpr size_t MAX_CARD_BODY_BYTES = 4 + 2 * 65535 + 2 * BMP_BYTES;
 static uint32_t putCardId = 0;
 static int      putCardBox = 0;
 static bool     putCardPracticed = false;
 static uint32_t pendingDeleteId = 0;
+
+#if BLE_TIMING_DEBUG
+struct PutTiming {
+  uint32_t headerAt;
+  uint32_t firstChunkAt;
+  uint32_t previousChunkAt;
+  uint32_t lastChunkAt;
+  uint32_t copyUs;
+  uint32_t maxCopyUs;
+  uint32_t maxGapUs;
+  uint32_t chunkCount;
+};
+static PutTiming putTiming = {};
+#endif
 
 // RxCallbacks::onWrite() runs on the NimBLE host task with a small stack.
 // Calling back into the BLE stack from there (e.g. a retry loop of indicate()
@@ -149,14 +170,51 @@ static void sendListOverBle() {
 }
 
 static void finishPutCard() {
-  if (putFile) putFile.close();
-
+#if BLE_TIMING_DEBUG
+  uint32_t finishAt = micros();
+  uint32_t sdOpenUs = 0, sdWriteUs = 0, sdCloseUs = 0, sdRenameUs = 0;
+#endif
   char path[24], tmpPath[28];
   cardFilePath(putCardId, path, sizeof(path));
   cardTmpPath(putCardId, tmpPath, sizeof(tmpPath));
   if (putOk) {
+    SD_MMC.remove(tmpPath);
+#if BLE_TIMING_DEBUG
+    uint32_t phaseAt = micros();
+#endif
+    File f = SD_MMC.open(tmpPath, FILE_WRITE);
+#if BLE_TIMING_DEBUG
+    sdOpenUs = micros() - phaseAt;
+#endif
+    if (!f) {
+      putOk = false;
+    } else {
+      uint8_t hdr[CARD_HEADER_BYTES];
+      encodeCardHeader(hdr, putCardId, putCardBox, putCardPracticed);
+#if BLE_TIMING_DEBUG
+      phaseAt = micros();
+#endif
+      putOk = (f.write(hdr, CARD_HEADER_BYTES) == CARD_HEADER_BYTES) &&
+              (putBody.empty() || f.write(putBody.data(), putBody.size()) == putBody.size());
+#if BLE_TIMING_DEBUG
+      sdWriteUs = micros() - phaseAt;
+      phaseAt = micros();
+#endif
+      f.close();
+#if BLE_TIMING_DEBUG
+      sdCloseUs = micros() - phaseAt;
+#endif
+    }
+  }
+  if (putOk) {
+#if BLE_TIMING_DEBUG
+    uint32_t phaseAt = micros();
+#endif
     SD_MMC.remove(path);
     putOk = SD_MMC.rename(tmpPath, path);
+#if BLE_TIMING_DEBUG
+    sdRenameUs = micros() - phaseAt;
+#endif
   }
   if (!putOk) SD_MMC.remove(tmpPath);
 
@@ -175,7 +233,24 @@ static void finishPutCard() {
   putU32(resp + 2, putCardId);
   sendChunkReliably(resp, sizeof(resp));
 
+#if BLE_TIMING_DEBUG
+  uint32_t doneAt = micros();
+  Serial.printf(
+    "BLE_TIMING card=%08X bytes=%u chunks=%u header_to_first=%.1fms "
+    "first_to_last=%.1fms max_gap=%.1fms copy_total=%.3fms max_copy=%.3fms "
+    "finish_wait=%.1fms sd_open=%.1fms sd_write=%.1fms sd_close=%.1fms "
+    "sd_rename=%.1fms finish_total=%.1fms\n",
+    (unsigned)putCardId, (unsigned)rxReceived, (unsigned)putTiming.chunkCount,
+    (putTiming.firstChunkAt - putTiming.headerAt) / 1000.0,
+    (putTiming.lastChunkAt - putTiming.firstChunkAt) / 1000.0,
+    putTiming.maxGapUs / 1000.0, putTiming.copyUs / 1000.0,
+    putTiming.maxCopyUs / 1000.0, (finishAt - putTiming.lastChunkAt) / 1000.0,
+    sdOpenUs / 1000.0, sdWriteUs / 1000.0, sdCloseUs / 1000.0,
+    sdRenameUs / 1000.0, (doneAt - finishAt) / 1000.0);
+#endif
+
   rxState = RX_IDLE;
+  putBody.clear();
 }
 
 static void deleteCardOnDevice(uint32_t id) {
@@ -223,20 +298,13 @@ class RxCallbacks : public BLECharacteristicCallbacks {
         putCardId = (reqId == 0) ? nextId++ : reqId;
         rxExpected = bodyLen;
         rxReceived = 0;
-        putOk = sdOk;
-        if (putOk) {
-          char tmpPath[28];
-          cardTmpPath(putCardId, tmpPath, sizeof(tmpPath));
-          SD_MMC.remove(tmpPath);
-          putFile = SD_MMC.open(tmpPath, FILE_WRITE);
-          if (!putFile) {
-            putOk = false;
-          } else {
-            uint8_t hdr[CARD_HEADER_BYTES];
-            encodeCardHeader(hdr, putCardId, putCardBox, putCardPracticed);
-            putOk = (putFile.write(hdr, CARD_HEADER_BYTES) == CARD_HEADER_BYTES);
-          }
-        }
+        putOk = sdOk && bodyLen <= MAX_CARD_BODY_BYTES;
+        putBody.clear();
+        if (putOk) putBody.resize(bodyLen);
+#if BLE_TIMING_DEBUG
+        putTiming = {};
+        putTiming.headerAt = micros();
+#endif
         if (bodyLen == 0) pendingAction = PENDING_FINISH_PUT_CARD;
         else rxState = RX_BODY;
       } else if (data[0] == 0x12 && len >= 5) {     // DELETE_CARD
@@ -246,10 +314,26 @@ class RxCallbacks : public BLECharacteristicCallbacks {
       } else if (data[0] == 0x13) {                 // DELETE_ALL
         pendingAction = PENDING_DELETE_ALL;
       }
-    } else {   // RX_BODY: raw body bytes, no framing -- streamed straight to
-               // the temp file rather than buffered in RAM.
+    } else {   // RX_BODY: raw body bytes, no framing -- copied into the
+               // one-card RAM buffer and committed by finishPutCard().
+#if BLE_TIMING_DEBUG
+      uint32_t chunkAt = micros();
+      if (putTiming.chunkCount == 0) putTiming.firstChunkAt = chunkAt;
+      else {
+        uint32_t gap = chunkAt - putTiming.previousChunkAt;
+        if (gap > putTiming.maxGapUs) putTiming.maxGapUs = gap;
+      }
+#endif
       size_t n = minSize(len, rxExpected - rxReceived);
-      if (putOk && n > 0 && putFile.write(data, n) != n) putOk = false;
+      if (putOk && n > 0) memcpy(putBody.data() + rxReceived, data, n);
+#if BLE_TIMING_DEBUG
+      uint32_t copyElapsed = micros() - chunkAt;
+      putTiming.copyUs += copyElapsed;
+      if (copyElapsed > putTiming.maxCopyUs) putTiming.maxCopyUs = copyElapsed;
+      putTiming.previousChunkAt = chunkAt;
+      putTiming.lastChunkAt = chunkAt;
+      putTiming.chunkCount++;
+#endif
       rxReceived += n;
       if (rxReceived >= rxExpected) pendingAction = PENDING_FINISH_PUT_CARD;
     }
@@ -260,14 +344,25 @@ class ServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer *pServer) override {
     bleConnected = true;
     rxState = RX_IDLE;
-    if (putFile) putFile.close();   // in case a prior connection dropped mid-PUT
+    putBody.clear();                 // discard a prior connection's partial PUT
     Serial.println("BLE: central connected");
-    // Deliberately no requestConnParams() here: calling into the GAP API from
-    // within a BLE callback is the same class of risk as sending from onWrite().
-    // If revisited, defer it to bleSyncTick().
+  }
+  void onConnect(BLEServer *pServer, ble_gap_conn_desc *desc) override {
+    bleConnHandle = desc->conn_handle;
+    connParamRequestPending = true;
+    Serial.printf("BLE_CONN initial interval=%.2fms latency=%u timeout=%ums handle=%u\n",
+                  desc->conn_itvl * 1.25, (unsigned)desc->conn_latency,
+                  (unsigned)desc->supervision_timeout * 10, (unsigned)desc->conn_handle);
+  }
+  void onConnParamsUpdate(uint16_t conn_handle, uint16_t interval,
+                          uint16_t latency, uint16_t timeout, uint8_t status) override {
+    Serial.printf("BLE_CONN updated status=%u interval=%.2fms latency=%u timeout=%ums handle=%u\n",
+                  (unsigned)status, interval * 1.25, (unsigned)latency,
+                  (unsigned)timeout * 10, (unsigned)conn_handle);
   }
   void onDisconnect(BLEServer *pServer) override {
     bleConnected = false;
+    connParamRequestPending = false;
     Serial.println("BLE: central disconnected, re-advertising");
     pServer->startAdvertising();
   }
@@ -305,6 +400,14 @@ void bleSyncStart() {
 }
 
 void bleSyncTick() {
+  // GAP calls are deliberately made from the Arduino task, never from the
+  // NimBLE callback. The central may accept, reject, or adjust this request.
+  if (connParamRequestPending) {
+    connParamRequestPending = false;
+    bool queued = pServer->requestConnParams(bleConnHandle, 12, 24, 0, 400);
+    Serial.printf("BLE_CONN request 15-30ms latency=0 -> %s\n", queued ? "queued" : "FAILED");
+  }
+
   // Snapshot-and-clear before dispatching in case the action itself takes a
   // while and bleConnected/rxState change during it.
   PendingBleAction action = pendingAction;

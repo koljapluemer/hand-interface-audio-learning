@@ -100,3 +100,8 @@ constexpr int INCORRECT_DELAY_MAX   = 7;
 // BLE calls from inside onWrite() (see PendingBleAction in ble_sync.cpp) --
 // but 180 is the known-stable value, so it stays.
 constexpr size_t BLE_CHUNK = 180;
+
+// Compile-time transfer diagnostics. When 0, the firmware timing counters and
+// serial summary are omitted entirely. Keep per-chunk logging out of callbacks:
+// it would change the timing we are trying to measure.
+#define BLE_TIMING_DEBUG 1
