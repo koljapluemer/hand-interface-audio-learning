@@ -81,8 +81,7 @@
 
   <div id="idle" class="text-center text-base-content/60 py-16">
     Tap <strong>Connect</strong>, then pick <strong>Flashcards</strong> from
-    the Bluetooth device list. On the device: gear icon &rarr; Settings &rarr;
-    Sync mode.
+    the Bluetooth device list. On the device: tap the connect icon (top-right).
   </div>
 
 </main>
@@ -108,7 +107,7 @@ const CHUNK = 180;   // must match BLE_CHUNK on the device (244 crashed the devi
 
 // ---- Card bitmap format (must match BMP_W/BMP_H and the /cards/<id>.bin
 // layout in 007_esp_s3_touch_flashcard_ble.ino) ----
-const BMP_W = 190, BMP_H = 36;
+const BMP_W = 200, BMP_H = 92;   // one half of the 200x184 content area
 const BMP_ROW_BYTES = Math.ceil(BMP_W / 8);
 const BMP_BYTES = BMP_ROW_BYTES * BMP_H;
 
@@ -239,14 +238,36 @@ function thresholdImageData(imgData, level) {
   return imgData;
 }
 
-// Renders `text` centered-vertically, left-aligned, shrinking the font until
-// it fits the box (falling back to horizontal squeeze via fillText's
-// maxWidth for pathological cases), then thresholds to black/white. Only
-// loads the font family/families this specific text needs (via `text` as
+// Greedy word-wrap (falls back to per-character breaks for unspaced scripts
+// like CJK, or a single word wider than the box). Uses the ctx's current font.
+function wrapLines(text, maxWidth) {
+  const lines = [];
+  for (const para of text.split('\n')) {
+    let line = '';
+    const tokens = para.includes(' ') ? para.split(/(?<= )/) : Array.from(para);
+    for (const tok of tokens) {
+      if (line && rctx.measureText(line + tok).width > maxWidth) {
+        lines.push(line.trimEnd());
+        line = '';
+      }
+      line += tok;
+    }
+    lines.push(line.trimEnd());
+  }
+  return lines;
+}
+
+// Renders `text` centered both ways in the box: starts at MAX_FONT_PX, wraps
+// to at most MAX_LINES lines, and shrinks the font until that fits (falling
+// back to a horizontal squeeze via fillText's maxWidth for pathological
+// cases), then thresholds to black/white. The box's first row is left blank
+// because the device draws its dashed separator over the back half's top row.
+// Only loads the font family/families this specific text needs (via `text` as
 // document.fonts.load()'s match string, so it resolves the actual
 // unicode-range chunk the characters need, not just some default one) --
 // the browser caches each chunk after the first fetch, so a deck's second
 // save, or a second card in the same script, is instant.
+const MAX_FONT_PX = 44, MIN_FONT_PX = 10, MAX_LINES = 3, LINE_GAP = 1.15;
 async function renderTextTo1bpp(text) {
   rctx.clearRect(0, 0, BMP_W, BMP_H);
   rctx.fillStyle = '#fff';
@@ -256,15 +277,19 @@ async function renderTextTo1bpp(text) {
     await Promise.all(fontFamiliesFor(text).map((fam) => document.fonts.load(`16px "${fam}"`, text)));
     rctx.fillStyle = '#000';
     rctx.textBaseline = 'middle';
-    rctx.textAlign = 'left';
-    const maxWidth = BMP_W - 4;
-    let size = BMP_H - 6;
-    rctx.font = `${size}px ${stack}`;
-    while (size > 8 && rctx.measureText(text).width > maxWidth) {
-      size -= 1;
+    rctx.textAlign = 'center';
+    const maxWidth = BMP_W - 8;
+    const usableH = BMP_H - 4;   // top row stays blank, plus a little bottom margin
+    let size = MAX_FONT_PX, lines;
+    for (;; size--) {
       rctx.font = `${size}px ${stack}`;
+      lines = wrapLines(text, maxWidth);
+      if (size <= MIN_FONT_PX) break;
+      if (lines.length <= MAX_LINES && lines.length * size * LINE_GAP <= usableH) break;
     }
-    rctx.fillText(text, 2, BMP_H / 2, maxWidth);
+    const lineH = size * LINE_GAP;
+    const top = 1 + (usableH - lines.length * lineH) / 2 + lineH / 2;
+    lines.forEach((ln, i) => rctx.fillText(ln, BMP_W / 2, top + i * lineH, maxWidth));
   }
   const imgData = rctx.getImageData(0, 0, BMP_W, BMP_H);
   return packBits(thresholdImageData(imgData, 128));
