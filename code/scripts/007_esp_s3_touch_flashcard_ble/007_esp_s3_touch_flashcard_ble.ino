@@ -157,8 +157,10 @@ void setup() {
   buildSessionQueue();
 
   state = ST_PROMPT;
-  // First draw after boot is forced full by GxEPD2 (initial refresh).
-  uiRenderCard(currentCard(), false, REGION_BELOW_TOP, REFRESH_PARTIAL);
+  // Must be an explicit full draw: GxEPD2 forces a full *refresh* on the first
+  // update, but only of what was written to RAM, so a partial window here
+  // would leave the rows outside it (the top icon strip) blank.
+  uiRenderCard(currentCard(), false, REGION_BELOW_TOP, REFRESH_FULL);
 
   Serial.println("top-left = hard refresh, top-right = sync; lower half = reveal / wrong / correct");
 }
